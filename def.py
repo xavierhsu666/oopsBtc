@@ -10,9 +10,10 @@ INTERVAL_MAIN = "5m"
 INTERVAL_REF = "15m"
 LIMIT = 100
 
-INITIAL_BALANCE = 1000  # 初始資金
+INITIAL_BALANCE = 36.28  # 初始資金
 LEVERAGE = 15  # 槓桿倍數
 RR_THRESHOLD = 1.2  # RR 條件
+FEE_RATE = 0.0004  # 幣安合約市價單 taker 費率
 
 USE_RSI_FILTER = False  # 是否啟用 RSI 過濾
 USE_TREND_FILTER = True  # 是否啟用順勢條件
@@ -155,6 +156,14 @@ def backtest(df_main, df_ref):
                 position = (balance * LEVERAGE) / entry_price
                 entry_time = latest["timestamp"]
 
+                # 手續費檢查
+                sch_profit = abs(entry_price - take_profit) * position
+                open_fee = entry_price * abs(position) * FEE_RATE
+                close_fee = take_profit * abs(position) * FEE_RATE
+                total_fee = open_fee + close_fee
+                if sch_profit - total_fee <= 0:
+                    continue
+
             # 空單
             elif latest["EMA9"] < latest["EMA21"]:
                 if USE_RSI_FILTER and latest["RSI"] <= 30:
@@ -173,6 +182,14 @@ def backtest(df_main, df_ref):
                     continue
                 position = -(balance * LEVERAGE) / entry_price
                 entry_time = latest["timestamp"]
+
+                # 手續費檢查
+                sch_profit = abs(entry_price - take_profit) * abs(position)
+                open_fee = entry_price * abs(position) * FEE_RATE
+                close_fee = take_profit * abs(position) * FEE_RATE
+                total_fee = open_fee + close_fee
+                if sch_profit - total_fee <= 0:
+                    continue
 
     # 統計結果
     win_trades = [t for t in trades if t > 0]
@@ -195,25 +212,21 @@ def backtest(df_main, df_ref):
     print("交易明細已匯出至 trade_df.xlsx")
 
 
+# ===== 實盤掃描 =====
 def pratical_scanner():
     print(f"\n[Scanner Detail]")
     balance = INITIAL_BALANCE
     position = 0
     entry_price = 0
-    trades = []
-    trade_details = []
 
     while True:
         try:
-            """取得資料"""
             df_main = get_klines(SYMBOL, INTERVAL_MAIN, LIMIT)
             df_ref = get_klines(SYMBOL, INTERVAL_REF, LIMIT)
-            """計算指標"""
             df_main = calculate_indicators(df_main)
             df_ref = calculate_indicators(df_ref)
 
             latest = df_main.iloc[-1]
-            # 開倉條件
             if position == 0:
                 m15_high, m15_low = get_last_m15_levels(df_ref, latest["timestamp"])
                 m15_trend_up = (
@@ -223,7 +236,8 @@ def pratical_scanner():
                     ]
                 )
                 m15_trend_down = not m15_trend_up
-                trend = "UP" if m15_trend_up else "DOWN" if m15_trend_down else "NO"
+                trend = "UP" if m15_trend_up else "DOWN"
+
                 EMA_trend = (
                     "="
                     if latest["EMA9"] == latest["EMA21"]
@@ -253,14 +267,15 @@ def pratical_scanner():
                         continue
                     position = (balance * LEVERAGE) / entry_price
 
-                    sch_profit = round(abs(entry_price - take_profit) * position, 2)
-                    sch_loss = round(abs(entry_price - stop_loss) * position, 2) * -1
-                    entry_time = latest["timestamp"]
+                    sch_profit = abs(entry_price - take_profit) * position
+                    open_fee = entry_price * abs(position) * FEE_RATE
+                    close_fee = take_profit * abs(position) * FEE_RATE
+                    total_fee = open_fee + close_fee
+                    if sch_profit - total_fee <= 0:
+                        continue
+
                     print(
-                        f"{entry_time}: 做多, place an order in {latest['close']}, take profit in {take_profit}:{sch_profit} USDT , stop loss in {stop_loss}:{sch_loss} USDT."
-                    )
-                    print(
-                        f"{latest['timestamp']}: Close: {round(latest['close'], 2)}, EMA9 {EMA_trend} EMA21, RSI: {round(latest['RSI'], 2)}, Trend: {trend}"
+                        f"{latest['timestamp']}: 做多, price={entry_price}, TP={take_profit}, SL={stop_loss}, 預估盈虧={sch_profit:.2f}, 手續費={total_fee:.2f}"
                     )
 
                 # 空單
@@ -280,14 +295,16 @@ def pratical_scanner():
                     if USE_RR_FILTER and rr <= RR_THRESHOLD:
                         continue
                     position = -(balance * LEVERAGE) / entry_price
-                    sch_profit = round(abs(entry_price - take_profit) * position, 2)
-                    sch_loss = round(abs(entry_price - stop_loss) * position, 2) * -1
-                    entry_time = latest["timestamp"]
+
+                    sch_profit = abs(entry_price - take_profit) * abs(position)
+                    open_fee = entry_price * abs(position) * FEE_RATE
+                    close_fee = take_profit * abs(position) * FEE_RATE
+                    total_fee = open_fee + close_fee
+                    if sch_profit - total_fee <= 0:
+                        continue
+
                     print(
-                        f"{entry_time}: 做空, place an order in {latest['close']}, take profit in {take_profit}:{sch_profit} USDT , stop loss in {stop_loss}:{sch_loss} USDT."
-                    )
-                    print(
-                        f"{latest['timestamp']}: Close: {round(latest['close'], 2)}, EMA9 {EMA_trend} EMA21, RSI: {round(latest['RSI'], 2)}, Trend: {trend}"
+                        f"{latest['timestamp']}: 做空, price={entry_price}, TP={take_profit}, SL={stop_loss}, 預估盈虧={sch_profit:.2f}, 手續費={total_fee:.2f}"
                     )
 
             time.sleep(15)
@@ -296,11 +313,5 @@ def pratical_scanner():
             time.sleep(15)
 
 
-# 執行回測
-# df_main = get_klines(SYMBOL, INTERVAL_MAIN, LIMIT)
-# df_ref = get_klines(SYMBOL, INTERVAL_REF, LIMIT)
-# df_main = calculate_indicators(df_main)
-# backtest(df_main, df_ref)
-
-# 執行實盤
+# ===== 執行實盤掃描 =====
 pratical_scanner()
