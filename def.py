@@ -15,10 +15,10 @@ LEVERAGE = 15  # 槓桿倍數
 RR_THRESHOLD = 1.2  # RR 條件
 FEE_RATE = 0.0004  # 幣安合約市價單 taker 費率
 
-USE_RSI_FILTER = False  # 是否啟用 RSI 過濾
-USE_TREND_FILTER = True  # 是否啟用順勢條件
-USE_RR_FILTER = True  # 是否啟用 RR 條件
-USE_STOP_TAKE_M15 = True  # 是否使用 M15 高低作為止盈止損
+USE_RSI_FILTER = False
+USE_TREND_FILTER = True
+USE_RR_FILTER = True
+USE_STOP_TAKE_M15 = True
 
 
 # ===== 取得歷史K線資料 =====
@@ -28,25 +28,13 @@ def get_klines(symbol, interval, limit):
     df = pd.DataFrame(
         data,
         columns=[
-            "timestamp",
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume",
-            "close_time",
-            "quote_asset_volume",
-            "num_trades",
-            "taker_buy_base",
-            "taker_buy_quote",
-            "ignore",
+            "timestamp", "open", "high", "low", "close", "volume",
+            "close_time", "quote_asset_volume", "num_trades",
+            "taker_buy_base", "taker_buy_quote", "ignore",
         ],
     )
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms") + pd.Timedelta(hours=8)
-    df["open"] = df["open"].astype(float)
-    df["high"] = df["high"].astype(float)
-    df["low"] = df["low"].astype(float)
-    df["close"] = df["close"].astype(float)
+    df[["open", "high", "low", "close"]] = df[["open", "high", "low", "close"]].astype(float)
     return df
 
 
@@ -64,152 +52,17 @@ def calculate_indicators(df):
     return df
 
 
-# ===== 找最近一根 M15 的高低 =====
 def get_last_m15_levels(m15_df, current_time):
     ref = m15_df[m15_df["timestamp"] <= current_time].iloc[-1]
     return ref["high"], ref["low"]
 
 
-# ===== 回測策略 =====
-def backtest(df_main, df_ref):
-    balance = INITIAL_BALANCE
-    position = 0
-    entry_price = 0
-    trades = []
-    trade_details = []
-
-    df_ref = calculate_indicators(df_ref)
-
-    for i in range(21, len(df_main)):
-        latest = df_main.iloc[i]
-
-        # 平倉檢查
-        if position != 0:
-            if position > 0:  # 多單
-                if latest["low"] <= stop_loss or latest["high"] >= take_profit:
-                    pnl = (latest["close"] - entry_price) * position
-                    balance += pnl
-                    trades.append(pnl)
-                    margin = (abs(position) * entry_price) / LEVERAGE
-                    trade_details.append(
-                        {
-                            "方向": "多單",
-                            "槓桿": LEVERAGE,
-                            "開倉大小": round(abs(position), 4),
-                            "保證金": round(margin, 2),
-                            "進場時間": entry_time,
-                            "進場價格": entry_price,
-                            "出場時間": latest["timestamp"],
-                            "出場價格": latest["close"],
-                            "盈虧": round(pnl, 2),
-                            "RR": rr,
-                        }
-                    )
-                    position = 0
-            else:  # 空單
-                if latest["high"] >= stop_loss or latest["low"] <= take_profit:
-                    pnl = (entry_price - latest["close"]) * abs(position)
-                    balance += pnl
-                    trades.append(pnl)
-                    margin = (abs(position) * entry_price) / LEVERAGE
-                    trade_details.append(
-                        {
-                            "方向": "空單",
-                            "槓桿": LEVERAGE,
-                            "開倉大小": round(abs(position), 4),
-                            "保證金": round(margin, 2),
-                            "進場時間": entry_time,
-                            "進場價格": entry_price,
-                            "出場時間": latest["timestamp"],
-                            "出場價格": latest["close"],
-                            "盈虧": round(pnl, 2),
-                            "RR": rr,
-                        }
-                    )
-                    position = 0
-
-        # 開倉條件
-        if position == 0:
-            m15_high, m15_low = get_last_m15_levels(df_ref, latest["timestamp"])
-            m15_trend_up = (
-                df_ref[df_ref["timestamp"] <= latest["timestamp"]].iloc[-1]["EMA9"]
-                > df_ref[df_ref["timestamp"] <= latest["timestamp"]].iloc[-1]["EMA21"]
-            )
-            m15_trend_down = not m15_trend_up
-
-            # 多單
-            if latest["EMA9"] > latest["EMA21"]:
-                if USE_RSI_FILTER and latest["RSI"] >= 70:
-                    continue
-                if USE_TREND_FILTER and not m15_trend_up:
-                    continue
-                entry_price = latest["close"]
-                if USE_STOP_TAKE_M15 and (
-                    m15_high <= entry_price or m15_low >= entry_price
-                ):
-                    continue
-                stop_loss = m15_low if USE_STOP_TAKE_M15 else latest["low"]
-                take_profit = m15_high if USE_STOP_TAKE_M15 else latest["high"]
-                rr = (take_profit - entry_price) / (entry_price - stop_loss)
-                if USE_RR_FILTER and rr <= RR_THRESHOLD:
-                    continue
-                position = (balance * LEVERAGE) / entry_price
-                entry_time = latest["timestamp"]
-
-                # 手續費檢查
-                sch_profit = abs(entry_price - take_profit) * position
-                open_fee = entry_price * abs(position) * FEE_RATE
-                close_fee = take_profit * abs(position) * FEE_RATE
-                total_fee = open_fee + close_fee
-                if sch_profit - total_fee <= 0:
-                    continue
-
-            # 空單
-            elif latest["EMA9"] < latest["EMA21"]:
-                if USE_RSI_FILTER and latest["RSI"] <= 30:
-                    continue
-                if USE_TREND_FILTER and not m15_trend_down:
-                    continue
-                entry_price = latest["close"]
-                if USE_STOP_TAKE_M15 and (
-                    m15_low >= entry_price or m15_high <= entry_price
-                ):
-                    continue
-                stop_loss = m15_high if USE_STOP_TAKE_M15 else latest["high"]
-                take_profit = m15_low if USE_STOP_TAKE_M15 else latest["low"]
-                rr = (entry_price - take_profit) / (stop_loss - entry_price)
-                if USE_RR_FILTER and rr <= RR_THRESHOLD:
-                    continue
-                position = -(balance * LEVERAGE) / entry_price
-                entry_time = latest["timestamp"]
-
-                # 手續費檢查
-                sch_profit = abs(entry_price - take_profit) * abs(position)
-                open_fee = entry_price * abs(position) * FEE_RATE
-                close_fee = take_profit * abs(position) * FEE_RATE
-                total_fee = open_fee + close_fee
-                if sch_profit - total_fee <= 0:
-                    continue
-
-    # 統計結果
-    win_trades = [t for t in trades if t > 0]
-    lose_trades = [t for t in trades if t <= 0]
-    win_rate = len(win_trades) / len(trades) * 100 if trades else 0
-    total_pnl = sum(trades)
-    max_drawdown = min(trades) if trades else 0
-
-    print("回測結果:")
-    print(f"初始資金: {INITIAL_BALANCE} USDT")
-    print(f"槓桿倍數: {LEVERAGE}x")
-    print(f"最終資金: {balance:.2f} USDT")
-    print(f"總盈虧: {total_pnl:.2f} USDT")
-    print(f"交易次數: {len(trades)}")
-    print(f"勝率: {win_rate:.2f}%")
-    print(f"最大單筆虧損: {max_drawdown:.2f} USDT")
-
-    trade_df = pd.DataFrame(trade_details)
-    trade_df.to_excel("trade_df.xlsx")
-    print("交易明細已匯出至 trade_df.xlsx")
+# ===== 強平價計算 =====
+def calc_liquidation_price(entry_price, leverage, side):
+    if side == "LONG":
+        return entry_price * (1 - 1 / leverage)
+    else:  # SHORT
+        return entry_price * (1 + 1 / leverage)
 
 
 # ===== 實盤掃描 =====
@@ -231,18 +84,14 @@ def pratical_scanner():
                 m15_high, m15_low = get_last_m15_levels(df_ref, latest["timestamp"])
                 m15_trend_up = (
                     df_ref[df_ref["timestamp"] <= latest["timestamp"]].iloc[-1]["EMA9"]
-                    > df_ref[df_ref["timestamp"] <= latest["timestamp"]].iloc[-1][
-                        "EMA21"
-                    ]
+                    > df_ref[df_ref["timestamp"] <= latest["timestamp"]].iloc[-1]["EMA21"]
                 )
                 m15_trend_down = not m15_trend_up
                 trend = "UP" if m15_trend_up else "DOWN"
 
                 EMA_trend = (
-                    "="
-                    if latest["EMA9"] == latest["EMA21"]
-                    else ">"
-                    if latest["EMA9"] > latest["EMA21"]
+                    "=" if latest["EMA9"] == latest["EMA21"]
+                    else ">" if latest["EMA9"] > latest["EMA21"]
                     else "<"
                 )
                 print(
@@ -256,9 +105,7 @@ def pratical_scanner():
                     if USE_TREND_FILTER and not m15_trend_up:
                         continue
                     entry_price = latest["close"]
-                    if USE_STOP_TAKE_M15 and (
-                        m15_high <= entry_price or m15_low >= entry_price
-                    ):
+                    if USE_STOP_TAKE_M15 and (m15_high <= entry_price or m15_low >= entry_price):
                         continue
                     stop_loss = m15_low if USE_STOP_TAKE_M15 else latest["low"]
                     take_profit = m15_high if USE_STOP_TAKE_M15 else latest["high"]
@@ -267,6 +114,13 @@ def pratical_scanner():
                         continue
                     position = (balance * LEVERAGE) / entry_price
 
+                    # 強平價檢查
+                    liquidation_price = calc_liquidation_price(entry_price, LEVERAGE, "LONG")
+                    if stop_loss <= liquidation_price:
+                        print(f"跳過: 止損({stop_loss}) <= 強平價({liquidation_price})")
+                        continue
+
+                    # 手續費檢查
                     sch_profit = abs(entry_price - take_profit) * position
                     open_fee = entry_price * abs(position) * FEE_RATE
                     close_fee = take_profit * abs(position) * FEE_RATE
@@ -274,9 +128,7 @@ def pratical_scanner():
                     if sch_profit - total_fee <= 0:
                         continue
 
-                    print(
-                        f"{latest['timestamp']}: 做多, price={entry_price}, TP={take_profit}, SL={stop_loss}, 預估盈虧={sch_profit:.2f}, 手續費={total_fee:.2f}"
-                    )
+                    print(f"{latest['timestamp']}: 做多, price={entry_price}, TP={take_profit}, SL={stop_loss}, 預估盈虧={sch_profit:.2f}, 手續費={total_fee:.2f}, 強平價={liquidation_price:.2f}")
 
                 # 空單
                 elif latest["EMA9"] < latest["EMA21"]:
@@ -285,9 +137,7 @@ def pratical_scanner():
                     if USE_TREND_FILTER and not m15_trend_down:
                         continue
                     entry_price = latest["close"]
-                    if USE_STOP_TAKE_M15 and (
-                        m15_low >= entry_price or m15_high <= entry_price
-                    ):
+                    if USE_STOP_TAKE_M15 and (m15_low >= entry_price or m15_high <= entry_price):
                         continue
                     stop_loss = m15_high if USE_STOP_TAKE_M15 else latest["high"]
                     take_profit = m15_low if USE_STOP_TAKE_M15 else latest["low"]
@@ -296,6 +146,13 @@ def pratical_scanner():
                         continue
                     position = -(balance * LEVERAGE) / entry_price
 
+                    # 強平價檢查
+                    liquidation_price = calc_liquidation_price(entry_price, LEVERAGE, "SHORT")
+                    if stop_loss >= liquidation_price:
+                        print(f"跳過: 止損({stop_loss}) >= 強平價({liquidation_price})")
+                        continue
+
+                    # 手續費檢查
                     sch_profit = abs(entry_price - take_profit) * abs(position)
                     open_fee = entry_price * abs(position) * FEE_RATE
                     close_fee = take_profit * abs(position) * FEE_RATE
@@ -303,9 +160,7 @@ def pratical_scanner():
                     if sch_profit - total_fee <= 0:
                         continue
 
-                    print(
-                        f"{latest['timestamp']}: 做空, price={entry_price}, TP={take_profit}, SL={stop_loss}, 預估盈虧={sch_profit:.2f}, 手續費={total_fee:.2f}"
-                    )
+                    print(f"{latest['timestamp']}: 做空, price={entry_price}, TP={take_profit}, SL={stop_loss}, 預估盈虧={sch_profit:.2f}, 手續費={total_fee:.2f}, 強平價={liquidation_price:.2f}")
 
             time.sleep(15)
         except Exception as e:
