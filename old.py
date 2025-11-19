@@ -18,6 +18,11 @@ USE_RSI_FILTER = False  # 是否啟用 RSI 過濾
 USE_TREND_FILTER = True  # 是否啟用順勢條件
 USE_RR_FILTER = True  # 是否啟用 RR 條件
 USE_STOP_TAKE_M15 = True  # 是否使用 M15 高低作為止盈止損
+FEE_RATE = 0.0005
+
+
+MIN_QTY = 0.001  # BTCUSDT Futures 最小單位
+MIN_NOTIONAL = 5  # 最小名義價值 (USDT)
 
 
 # ===== 取得歷史K線資料 =====
@@ -129,6 +134,10 @@ def backtest(df_main, df_ref):
     balance = INITIAL_BALANCE
     position = 0
     entry_price = 0
+    stop_loss = 0
+    take_profit = 0
+    rr = 0
+    entry_time = None
     trades = []
     trade_details = []
 
@@ -218,6 +227,15 @@ def backtest(df_main, df_ref):
     print("交易明細已匯出至 trade_df.xlsx")
 
 
+def adjust_position_size(position, entry_price):
+    # 四捨五入到最小單位
+    adjusted = round(position // MIN_QTY * MIN_QTY, 3)
+    # 檢查名義價值
+    if adjusted * entry_price < MIN_NOTIONAL:
+        return 0  # 不符合要求，返回 0 表示不開倉
+    return adjusted
+
+
 # ===== 實盤掃描 =====
 def pratical_scanner():
     print(f"\n[Scanner Detail]")
@@ -243,10 +261,105 @@ def pratical_scanner():
                     f"{latest['timestamp']}: {signal_info['signal']} 訊號, 進場 {signal_info['entry_price']}, TP {signal_info['take_profit']}, SL {signal_info['stop_loss']}, RR {round(signal_info['rr'], 2)}"
                 )
 
-            time.sleep(0.3)
+                position = (
+                    (INITIAL_BALANCE * LEVERAGE) / signal_info["entry_price"]
+                    if signal_info["signal"] == "LONG"
+                    else -(INITIAL_BALANCE * LEVERAGE) / signal_info["entry_price"]
+                )
+                position = adjust_position_size(position, signal_info["entry_price"])
+                if signal_info["signal"] == "LONG":
+                    while True:
+                        df_check = get_klines(SYMBOL, INTERVAL_MAIN, 1)
+                        current_price = df_check.iloc[-1]["close"]
+
+                        if (
+                            position > 0
+                            and (
+                                current_price >= signal_info["take_profit"]
+                                or current_price <= signal_info["stop_loss"]
+                            )
+                        ) or (
+                            position < 0
+                            and (
+                                current_price <= signal_info["take_profit"]
+                                or current_price >= signal_info["stop_loss"]
+                            )
+                        ):
+                            # 計算盈虧
+                            if position > 0:
+                                pnl = (
+                                    current_price - signal_info["entry_price"]
+                                ) * position
+                            else:
+                                pnl = (
+                                    signal_info["entry_price"] - current_price
+                                ) * abs(position)
+
+                            # 手續費
+                            open_fee = (
+                                signal_info["entry_price"] * abs(position) * FEE_RATE
+                            )
+                            close_fee = current_price * abs(position) * FEE_RATE
+                            total_fee = open_fee + close_fee
+                            net_pnl = pnl - total_fee
+
+                            print(
+                                f"交易完成: 出場價={current_price}, 盈虧={net_pnl:.2f} USDT (手續費={total_fee:.2f})"
+                            )
+                            position = 0
+                            break
+                elif signal_info["signal"] == "SHORT":
+                    # 監控迴圈
+                    while True:
+                        df_check = get_klines(SYMBOL, INTERVAL_MAIN, 1)
+                        current_price = df_check.iloc[-1]["close"]
+
+                        if (
+                            position > 0
+                            and (
+                                current_price >= signal_info["take_profit"]
+                                or current_price <= signal_info["stop_loss"]
+                            )
+                        ) or (
+                            position < 0
+                            and (
+                                current_price <= signal_info["take_profit"]
+                                or current_price >= signal_info["stop_loss"]
+                            )
+                        ):
+                            # 計算盈虧
+                            if position > 0:
+                                pnl = (
+                                    current_price - signal_info["entry_price"]
+                                ) * position
+                            else:
+                                pnl = (
+                                    signal_info["entry_price"] - current_price
+                                ) * abs(position)
+
+                            # 手續費
+                            open_fee = (
+                                signal_info["entry_price"] * abs(position) * FEE_RATE
+                            )
+                            close_fee = current_price * abs(position) * FEE_RATE
+                            total_fee = open_fee + close_fee
+                            net_pnl = pnl - total_fee
+
+                            print(
+                                f"交易完成: 出場價={current_price}, 盈虧={net_pnl:.2f} USDT (手續費={total_fee:.2f})"
+                            )
+                            position = 0
+                            break
+
+            time.sleep(15)
         except Exception as e:
             print("錯誤:", e)
-            time.sleep(0.3)
+            time.sleep(15)
+
+            time.sleep(15)
+        except Exception as e:
+            print("錯誤:", e)
+            time.sleep(15)
 
 
 # ===== 執行回測 =====
