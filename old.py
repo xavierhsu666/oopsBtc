@@ -42,10 +42,9 @@ def get_klines(symbol, interval, limit):
         ],
     )
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms") + pd.Timedelta(hours=8)
-    df["open"] = df["open"].astype(float)
-    df["high"] = df["high"].astype(float)
-    df["low"] = df["low"].astype(float)
-    df["close"] = df["close"].astype(float)
+    df[["open", "high", "low", "close"]] = df[["open", "high", "low", "close"]].astype(
+        float
+    )
     return df
 
 
@@ -67,6 +66,62 @@ def calculate_indicators(df):
 def get_last_m15_levels(m15_df, current_time):
     ref = m15_df[m15_df["timestamp"] <= current_time].iloc[-1]
     return ref["high"], ref["low"]
+
+
+# ===== 產生交易訊號 =====
+def generate_signal(latest, df_ref):
+    m15_high, m15_low = get_last_m15_levels(df_ref, latest["timestamp"])
+    m15_trend_up = (
+        df_ref[df_ref["timestamp"] <= latest["timestamp"]].iloc[-1]["EMA9"]
+        > df_ref[df_ref["timestamp"] <= latest["timestamp"]].iloc[-1]["EMA21"]
+    )
+    m15_trend_down = not m15_trend_up
+
+    # 多單
+    if latest["EMA9"] > latest["EMA21"]:
+        if USE_RSI_FILTER and latest["RSI"] >= 70:
+            return None
+        if USE_TREND_FILTER and not m15_trend_up:
+            return None
+        entry_price = latest["close"]
+        if USE_STOP_TAKE_M15 and (m15_high <= entry_price or m15_low >= entry_price):
+            return None
+        stop_loss = m15_low if USE_STOP_TAKE_M15 else latest["low"]
+        take_profit = m15_high if USE_STOP_TAKE_M15 else latest["high"]
+        rr = (take_profit - entry_price) / (entry_price - stop_loss)
+        if USE_RR_FILTER and rr <= RR_THRESHOLD:
+            return None
+        return {
+            "signal": "LONG",
+            "entry_price": entry_price,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "rr": rr,
+        }
+
+    # 空單
+    elif latest["EMA9"] < latest["EMA21"]:
+        if USE_RSI_FILTER and latest["RSI"] <= 30:
+            return None
+        if USE_TREND_FILTER and not m15_trend_down:
+            return None
+        entry_price = latest["close"]
+        if USE_STOP_TAKE_M15 and (m15_low >= entry_price or m15_high <= entry_price):
+            return None
+        stop_loss = m15_high if USE_STOP_TAKE_M15 else latest["high"]
+        take_profit = m15_low if USE_STOP_TAKE_M15 else latest["low"]
+        rr = (entry_price - take_profit) / (stop_loss - entry_price)
+        if USE_RR_FILTER and rr <= RR_THRESHOLD:
+            return None
+        return {
+            "signal": "SHORT",
+            "entry_price": entry_price,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "rr": rr,
+        }
+
+    return None
 
 
 # ===== 回測策略 =====
@@ -129,50 +184,18 @@ def backtest(df_main, df_ref):
 
         # 開倉條件
         if position == 0:
-            m15_high, m15_low = get_last_m15_levels(df_ref, latest["timestamp"])
-            m15_trend_up = (
-                df_ref[df_ref["timestamp"] <= latest["timestamp"]].iloc[-1]["EMA9"]
-                > df_ref[df_ref["timestamp"] <= latest["timestamp"]].iloc[-1]["EMA21"]
-            )
-            m15_trend_down = not m15_trend_up
-
-            # 多單
-            if latest["EMA9"] > latest["EMA21"]:
-                if USE_RSI_FILTER and latest["RSI"] >= 70:
-                    continue
-                if USE_TREND_FILTER and not m15_trend_up:
-                    continue
-                entry_price = latest["close"]
-                if USE_STOP_TAKE_M15 and (
-                    m15_high <= entry_price or m15_low >= entry_price
-                ):
-                    continue
-                stop_loss = m15_low if USE_STOP_TAKE_M15 else latest["low"]
-                take_profit = m15_high if USE_STOP_TAKE_M15 else latest["high"]
-                rr = (take_profit - entry_price) / (entry_price - stop_loss)
-                if USE_RR_FILTER and rr <= RR_THRESHOLD:
-                    continue
-                position = (balance * LEVERAGE) / entry_price
+            signal_info = generate_signal(latest, df_ref)
+            if signal_info:
+                entry_price = signal_info["entry_price"]
+                stop_loss = signal_info["stop_loss"]
+                take_profit = signal_info["take_profit"]
+                rr = signal_info["rr"]
                 entry_time = latest["timestamp"]
-
-            # 空單
-            elif latest["EMA9"] < latest["EMA21"]:
-                if USE_RSI_FILTER and latest["RSI"] <= 30:
-                    continue
-                if USE_TREND_FILTER and not m15_trend_down:
-                    continue
-                entry_price = latest["close"]
-                if USE_STOP_TAKE_M15 and (
-                    m15_low >= entry_price or m15_high <= entry_price
-                ):
-                    continue
-                stop_loss = m15_high if USE_STOP_TAKE_M15 else latest["high"]
-                take_profit = m15_low if USE_STOP_TAKE_M15 else latest["low"]
-                rr = (entry_price - take_profit) / (stop_loss - entry_price)
-                if USE_RR_FILTER and rr <= RR_THRESHOLD:
-                    continue
-                position = -(balance * LEVERAGE) / entry_price
-                entry_time = latest["timestamp"]
+                position = (
+                    (balance * LEVERAGE) / entry_price
+                    if signal_info["signal"] == "LONG"
+                    else -(balance * LEVERAGE) / entry_price
+                )
 
     # 統計結果
     win_trades = [t for t in trades if t > 0]
@@ -195,98 +218,42 @@ def backtest(df_main, df_ref):
     print("交易明細已匯出至 trade_df.xlsx")
 
 
+# ===== 實盤掃描 =====
 def pratical_scanner():
     print(f"\n[Scanner Detail]")
-    balance = INITIAL_BALANCE
     position = 0
-    entry_price = 0
-    trades = []
-    trade_details = []
 
     while True:
         try:
-            """取得資料"""
             df_main = get_klines(SYMBOL, INTERVAL_MAIN, LIMIT)
             df_ref = get_klines(SYMBOL, INTERVAL_REF, LIMIT)
-            """計算指標"""
             df_main = calculate_indicators(df_main)
             df_ref = calculate_indicators(df_ref)
 
             latest = df_main.iloc[-1]
-            # 開倉條件
-            if position == 0:
-                m15_high, m15_low = get_last_m15_levels(df_ref, latest["timestamp"])
-                m15_trend_up = (
-                    df_ref[df_ref["timestamp"] <= latest["timestamp"]].iloc[-1]["EMA9"]
-                    > df_ref[df_ref["timestamp"] <= latest["timestamp"]].iloc[-1][
-                        "EMA21"
-                    ]
-                )
-                m15_trend_down = not m15_trend_up
-                trend = "UP" if m15_trend_up else "DOWN" if m15_trend_down else "NO"
-                EMA_trend = (
-                    "="
-                    if latest["EMA9"] == latest["EMA21"]
-                    else ">"
-                    if latest["EMA9"] > latest["EMA21"]
-                    else "<"
-                )
+            signal_info = generate_signal(latest, df_ref)
+
+            trend = "UP" if latest["EMA9"] > latest["EMA21"] else "DOWN"
+            print(
+                f"{latest['timestamp']}: Close: {round(latest['close'], 2)}, EMA Trend: {trend}, RSI: {round(latest['RSI'], 2)}"
+            )
+
+            if position == 0 and signal_info:
                 print(
-                    f"{latest['timestamp']}: Close: {round(latest['close'], 2)}, EMA9 {EMA_trend} EMA21, RSI: {round(latest['RSI'], 2)}, Trend: {trend}"
+                    f"{latest['timestamp']}: {signal_info['signal']} 訊號, 進場 {signal_info['entry_price']}, TP {signal_info['take_profit']}, SL {signal_info['stop_loss']}, RR {round(signal_info['rr'], 2)}"
                 )
 
-                # 多單
-                if latest["EMA9"] > latest["EMA21"]:
-                    if USE_RSI_FILTER and latest["RSI"] >= 70:
-                        continue
-                    if USE_TREND_FILTER and not m15_trend_up:
-                        continue
-                    entry_price = latest["close"]
-                    if USE_STOP_TAKE_M15 and (
-                        m15_high <= entry_price or m15_low >= entry_price
-                    ):
-                        continue
-                    stop_loss = m15_low if USE_STOP_TAKE_M15 else latest["low"]
-                    take_profit = m15_high if USE_STOP_TAKE_M15 else latest["high"]
-                    rr = (take_profit - entry_price) / (entry_price - stop_loss)
-                    if USE_RR_FILTER and rr <= RR_THRESHOLD:
-                        continue
-                    position = (balance * LEVERAGE) / entry_price
-                    entry_time = latest["timestamp"]
-                    print(f"{entry_time}:做多, place an order in {latest['close']}, take profit in {take_profit}, stop loss in {stop_loss}.")
-
-                # 空單
-                elif latest["EMA9"] < latest["EMA21"]:
-                    if USE_RSI_FILTER and latest["RSI"] <= 30:
-                        continue
-                    if USE_TREND_FILTER and not m15_trend_down:
-                        continue
-                    entry_price = latest["close"]
-                    if USE_STOP_TAKE_M15 and (
-                        m15_low >= entry_price or m15_high <= entry_price
-                    ):
-                        continue
-                    stop_loss = m15_high if USE_STOP_TAKE_M15 else latest["high"]
-                    take_profit = m15_low if USE_STOP_TAKE_M15 else latest["low"]
-                    rr = (entry_price - take_profit) / (stop_loss - entry_price)
-                    if USE_RR_FILTER and rr <= RR_THRESHOLD:
-                        continue
-                    position = -(balance * LEVERAGE) / entry_price
-                    entry_time = latest["timestamp"]
-                    print(f"{entry_time}: 做空, place an order in {latest['close']}, take profit in {take_profit}, stop loss in {stop_loss}.")
-                    
-
-            time.sleep(15)
+            time.sleep(0.3)
         except Exception as e:
             print("錯誤:", e)
-            time.sleep(15)
+            time.sleep(0.3)
 
 
-# 執行回測
-df_main = get_klines(SYMBOL, INTERVAL_MAIN, LIMIT)
-df_ref = get_klines(SYMBOL, INTERVAL_REF, LIMIT)
-df_main = calculate_indicators(df_main)
-backtest(df_main, df_ref)
+# ===== 執行回測 =====
+# df_main = get_klines(SYMBOL, INTERVAL_MAIN, LIMIT)
+# df_ref = get_klines(SYMBOL, INTERVAL_REF, LIMIT)
+# df_main = calculate_indicators(df_main)
+# backtest(df_main, df_ref)
 
-# 執行實盤
-# pratical_scanner()
+# ===== 執行實盤 =====
+pratical_scanner()
