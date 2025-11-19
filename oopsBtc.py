@@ -200,7 +200,10 @@ class TradingStrategy:
         print(f"回測完成，最終資金: {balance:.2f} USDT，交易次數: {len(trades)}")
 
 
-# 初始化策略
+import time
+from binance.enums import SIDE_BUY, SIDE_SELL
+
+# 初始化策略與 API
 strategy = TradingStrategy(
     initial_balance=1000,
     leverage=15,
@@ -211,16 +214,58 @@ strategy = TradingStrategy(
     use_m15=True,
 )
 
-# 抓資料
-df_main = strategy.get_klines("BTCUSDT", "5m", 1000)
-df_ref = strategy.get_klines("BTCUSDT", "15m", 1000)
-df_main = strategy.calculate_indicators(df_main)
+api_manager = BinanceAPIManager(
+    api_key="你的API_KEY", api_secret="你的API_SECRET", testnet=True
+)
+api_manager.set_leverage("BTCUSDT", 15)
 
-# 回測
-strategy.backtest(df_main, df_ref)
 
-# 初始化幣安 API
-# api_manager = BinanceAPIManager(
-#     api_key="你的API_KEY", api_secret="你的API_SECRET", testnet=True
-# )
-# api_manager.set_leverage("BTCUSDT", 15)
+def scan_and_trade():
+    # 抓最新資料
+    df_main = strategy.get_klines("BTCUSDT", "5m", 200)
+    df_ref = strategy.get_klines("BTCUSDT", "15m", 200)
+    df_main = strategy.calculate_indicators(df_main)
+    df_ref = strategy.calculate_indicators(df_ref)
+
+    # 判斷最新一根 K 線是否有信號
+    latest = df_main.iloc[-1]
+    m15_high, m15_low = strategy.get_last_m15_levels(df_ref, latest["timestamp"])
+    m15_trend_up = (
+        df_ref[df_ref["timestamp"] <= latest["timestamp"]].iloc[-1]["EMA9"]
+        > df_ref[df_ref["timestamp"] <= latest["timestamp"]].iloc[-1]["EMA21"]
+    )
+    m15_trend_down = not m15_trend_up
+
+    # 多單信號
+    if latest["EMA9"] > latest["EMA21"] and m15_trend_up:
+        rr = (m15_high - latest["close"]) / (latest["close"] - m15_low)
+        if rr > 1.2:
+            qty = round(
+                (strategy.initial_balance * strategy.leverage) / latest["close"], 4
+            )
+            print(f"多單信號 → 下單 {qty} BTC")
+            api_manager.place_order(
+                "BTCUSDT", SIDE_BUY, qty, take_profit=m15_high, stop_loss=m15_low
+            )
+
+    # 空單信號
+    elif latest["EMA9"] < latest["EMA21"] and m15_trend_down:
+        rr = (latest["close"] - m15_low) / (m15_high - latest["close"])
+        if rr > 1.2:
+            qty = round(
+                (strategy.initial_balance * strategy.leverage) / latest["close"], 4
+            )
+            print(f"空單信號 → 下單 {qty} BTC")
+            api_manager.place_order(
+                "BTCUSDT", SIDE_SELL, qty, take_profit=m15_low, stop_loss=m15_high
+            )
+
+
+# 每 15 秒執行一次
+while True:
+    try:
+        scan_and_trade()
+        time.sleep(15)
+    except Exception as e:
+        print("錯誤:", e)
+        time.sleep(15)
