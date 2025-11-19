@@ -13,7 +13,7 @@ LIMIT = 100
 INITIAL_BALANCE = 36.28  # 初始資金
 LEVERAGE = 15  # 槓桿倍數
 RR_THRESHOLD = 1.2  # RR 條件
-FEE_RATE = 0.0004  # 幣安合約市價單 taker 費率
+FEE_RATE = 0.0005  # 幣安合約市價單 taker 費率
 
 USE_RSI_FILTER = False
 USE_TREND_FILTER = True
@@ -28,13 +28,24 @@ def get_klines(symbol, interval, limit):
     df = pd.DataFrame(
         data,
         columns=[
-            "timestamp", "open", "high", "low", "close", "volume",
-            "close_time", "quote_asset_volume", "num_trades",
-            "taker_buy_base", "taker_buy_quote", "ignore",
+            "timestamp",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "close_time",
+            "quote_asset_volume",
+            "num_trades",
+            "taker_buy_base",
+            "taker_buy_quote",
+            "ignore",
         ],
     )
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms") + pd.Timedelta(hours=8)
-    df[["open", "high", "low", "close"]] = df[["open", "high", "low", "close"]].astype(float)
+    df[["open", "high", "low", "close"]] = df[["open", "high", "low", "close"]].astype(
+        float
+    )
     return df
 
 
@@ -65,6 +76,19 @@ def calc_liquidation_price(entry_price, leverage, side):
         return entry_price * (1 + 1 / leverage)
 
 
+MIN_QTY = 0.001  # BTCUSDT Futures 最小單位
+MIN_NOTIONAL = 5  # 最小名義價值 (USDT)
+
+
+def adjust_position_size(position, entry_price):
+    # 四捨五入到最小單位
+    adjusted = round(position // MIN_QTY * MIN_QTY, 3)
+    # 檢查名義價值
+    if adjusted * entry_price < MIN_NOTIONAL:
+        return 0  # 不符合要求，返回 0 表示不開倉
+    return adjusted
+
+
 # ===== 實盤掃描 =====
 def pratical_scanner():
     print(f"\n[Scanner Detail]")
@@ -84,14 +108,18 @@ def pratical_scanner():
                 m15_high, m15_low = get_last_m15_levels(df_ref, latest["timestamp"])
                 m15_trend_up = (
                     df_ref[df_ref["timestamp"] <= latest["timestamp"]].iloc[-1]["EMA9"]
-                    > df_ref[df_ref["timestamp"] <= latest["timestamp"]].iloc[-1]["EMA21"]
+                    > df_ref[df_ref["timestamp"] <= latest["timestamp"]].iloc[-1][
+                        "EMA21"
+                    ]
                 )
                 m15_trend_down = not m15_trend_up
                 trend = "UP" if m15_trend_up else "DOWN"
 
                 EMA_trend = (
-                    "=" if latest["EMA9"] == latest["EMA21"]
-                    else ">" if latest["EMA9"] > latest["EMA21"]
+                    "="
+                    if latest["EMA9"] == latest["EMA21"]
+                    else ">"
+                    if latest["EMA9"] > latest["EMA21"]
                     else "<"
                 )
                 print(
@@ -105,7 +133,9 @@ def pratical_scanner():
                     if USE_TREND_FILTER and not m15_trend_up:
                         continue
                     entry_price = latest["close"]
-                    if USE_STOP_TAKE_M15 and (m15_high <= entry_price or m15_low >= entry_price):
+                    if USE_STOP_TAKE_M15 and (
+                        m15_high <= entry_price or m15_low >= entry_price
+                    ):
                         continue
                     stop_loss = m15_low if USE_STOP_TAKE_M15 else latest["low"]
                     take_profit = m15_high if USE_STOP_TAKE_M15 else latest["high"]
@@ -113,9 +143,11 @@ def pratical_scanner():
                     if USE_RR_FILTER and rr <= RR_THRESHOLD:
                         continue
                     position = (balance * LEVERAGE) / entry_price
-
+                    position = adjust_position_size(position, entry_price)
                     # 強平價檢查
-                    liquidation_price = calc_liquidation_price(entry_price, LEVERAGE, "LONG")
+                    liquidation_price = calc_liquidation_price(
+                        entry_price, LEVERAGE, "LONG"
+                    )
                     if stop_loss <= liquidation_price:
                         print(f"跳過: 止損({stop_loss}) <= 強平價({liquidation_price})")
                         continue
@@ -128,7 +160,44 @@ def pratical_scanner():
                     if sch_profit - total_fee <= 0:
                         continue
 
-                    print(f"{latest['timestamp']}: 做多, price={entry_price}, TP={take_profit}, SL={stop_loss}, 預估盈虧={sch_profit:.2f}, 手續費={total_fee:.2f}, 強平價={liquidation_price:.2f}")
+                    print(
+                        f"{latest['timestamp']}: 做多, price={entry_price}, TP={take_profit}, SL={stop_loss}, 預估盈虧={sch_profit:.2f}, 手續費={total_fee:.2f}, 強平價={liquidation_price:.2f}"
+                    )
+                    # 監控迴圈
+                    while True:
+                        df_check = get_klines(SYMBOL, INTERVAL_MAIN, 1)
+                        current_price = df_check.iloc[-1]["close"]
+
+                        if (
+                            position > 0
+                            and (
+                                current_price >= take_profit
+                                or current_price <= stop_loss
+                            )
+                        ) or (
+                            position < 0
+                            and (
+                                current_price <= take_profit
+                                or current_price >= stop_loss
+                            )
+                        ):
+                            # 計算盈虧
+                            if position > 0:
+                                pnl = (current_price - entry_price) * position
+                            else:
+                                pnl = (entry_price - current_price) * abs(position)
+
+                            # 手續費
+                            open_fee = entry_price * abs(position) * FEE_RATE
+                            close_fee = current_price * abs(position) * FEE_RATE
+                            total_fee = open_fee + close_fee
+                            net_pnl = pnl - total_fee
+
+                            print(
+                                f"交易完成: 出場價={current_price}, 盈虧={net_pnl:.2f} USDT (手續費={total_fee:.2f})"
+                            )
+                            position = 0
+                            break
 
                 # 空單
                 elif latest["EMA9"] < latest["EMA21"]:
@@ -137,7 +206,9 @@ def pratical_scanner():
                     if USE_TREND_FILTER and not m15_trend_down:
                         continue
                     entry_price = latest["close"]
-                    if USE_STOP_TAKE_M15 and (m15_low >= entry_price or m15_high <= entry_price):
+                    if USE_STOP_TAKE_M15 and (
+                        m15_low >= entry_price or m15_high <= entry_price
+                    ):
                         continue
                     stop_loss = m15_high if USE_STOP_TAKE_M15 else latest["high"]
                     take_profit = m15_low if USE_STOP_TAKE_M15 else latest["low"]
@@ -145,9 +216,12 @@ def pratical_scanner():
                     if USE_RR_FILTER and rr <= RR_THRESHOLD:
                         continue
                     position = -(balance * LEVERAGE) / entry_price
+                    position = adjust_position_size(position, entry_price)
 
                     # 強平價檢查
-                    liquidation_price = calc_liquidation_price(entry_price, LEVERAGE, "SHORT")
+                    liquidation_price = calc_liquidation_price(
+                        entry_price, LEVERAGE, "SHORT"
+                    )
                     if stop_loss >= liquidation_price:
                         print(f"跳過: 止損({stop_loss}) >= 強平價({liquidation_price})")
                         continue
@@ -160,12 +234,73 @@ def pratical_scanner():
                     if sch_profit - total_fee <= 0:
                         continue
 
-                    print(f"{latest['timestamp']}: 做空, price={entry_price}, TP={take_profit}, SL={stop_loss}, 預估盈虧={sch_profit:.2f}, 手續費={total_fee:.2f}, 強平價={liquidation_price:.2f}")
+                    print(
+                        f"{latest['timestamp']}: 做空, price={entry_price}, TP={take_profit}, SL={stop_loss}, 預估盈虧={sch_profit:.2f}, 手續費={total_fee:.2f}, 強平價={liquidation_price:.2f}"
+                    )
+                    # 監控迴圈
+                    while True:
+                        df_check = get_klines(SYMBOL, INTERVAL_MAIN, 1)
+                        current_price = df_check.iloc[-1]["close"]
+
+                        if (
+                            position > 0
+                            and (
+                                current_price >= take_profit
+                                or current_price <= stop_loss
+                            )
+                        ) or (
+                            position < 0
+                            and (
+                                current_price <= take_profit
+                                or current_price >= stop_loss
+                            )
+                        ):
+                            # 計算盈虧
+                            if position > 0:
+                                pnl = (current_price - entry_price) * position
+                            else:
+                                pnl = (entry_price - current_price) * abs(position)
+
+                            # 手續費
+                            open_fee = entry_price * abs(position) * FEE_RATE
+                            close_fee = current_price * abs(position) * FEE_RATE
+                            total_fee = open_fee + close_fee
+                            net_pnl = pnl - total_fee
+
+                            print(
+                                f"交易完成: 出場價={current_price}, 盈虧={net_pnl:.2f} USDT (手續費={total_fee:.2f})"
+                            )
+                            position = 0
+                            break
 
             time.sleep(15)
         except Exception as e:
             print("錯誤:", e)
             time.sleep(15)
+
+
+import requests
+
+# Telegram Bot Token 和 Chat ID
+TELEGRAM_TOKEN = "你的BotToken"
+CHAT_ID = "你的ChatID"
+
+
+def send_telegram_message(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": message,
+        "parse_mode": "Markdown",  # 可選: 支援 Markdown 格式
+    }
+    try:
+        response = requests.post(url, data=payload)
+        if response.status_code == 200:
+            print("Telegram通知已發送")
+        else:
+            print(f"Telegram通知失敗: {response.text}")
+    except Exception as e:
+        print(f"Telegram通知錯誤: {e}")
 
 
 # ===== 執行實盤掃描 =====
