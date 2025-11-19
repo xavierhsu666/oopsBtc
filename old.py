@@ -158,6 +158,26 @@ def notify_close(
     )
     send_telegram_message(message)
 
+def notify_open(
+    signal_info, exit_price, position, entry_time, net_pnl, total_fee, reason
+):
+    direction = signal_info["signal"]
+    entry_price = signal_info["entry_price"]
+    qty = abs(position)
+    sch_profit = abs(signal_info["take_profit"] - signal_info["entry_price"])*qty
+    sch_loss = abs(signal_info["stop_loss"] - signal_info["entry_price"])*qty*
+        
+    message = (
+        f"🟢 {direction} 開倉 @ {entry_price}\n"
+        f"進場時間: {entry_time}\n"
+        f"倉位: {qty:.4f} BTC\n"
+        f"進場價: {entry_price}\n"
+        f"止盈價 (TP): {signal_info["take_profit"]:.2f}\n"
+        f"止損價 (SL): {signal_info["stop_loss"]:.2f}\n"
+        f"總手續費預估: {total_fee:.2f} USDT"
+        f"預估損益: +{sch_profit} / -{sch_loss} USDT\n"
+    )
+    send_telegram_message(message)
 
 # ===== 倉位調整 =====
 def adjust_position_size(position, entry_price):
