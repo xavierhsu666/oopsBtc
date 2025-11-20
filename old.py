@@ -10,6 +10,7 @@ SYMBOL = "BTCUSDT"
 INTERVAL_MAIN = "5m"
 INTERVAL_REF = "15m"
 LIMIT = 100
+BACKTEST_LIMIT = 1000
 
 INITIAL_BALANCE = 100  # 初始資金
 LEVERAGE = 15  # 槓桿倍數
@@ -19,9 +20,12 @@ USE_RSI_FILTER = True  # 是否啟用 RSI 過濾
 USE_TREND_FILTER = True  # 是否啟用順勢條件
 USE_RR_FILTER = True  # 是否啟用 RR 條件
 USE_STOP_TAKE_M15 = True  # 是否使用 M15 高低作為止盈止損
+USE_SL_OPTIMIZER = True  # 是否根據ATR使用SL優化器
+SL_OPTIMIZER_THRESHOLD = 0.3  # ATR - SL優化器 TH
 TAKER_FEE_RATE = 0.0005  # 吃單方(市價單)
 MAKER_FEE_RATE = 0.0002  # 掛單方(限價單)
 MIN_PROFIT = 0.5
+MAX_LOSS = INITIAL_BALANCE * 0.02
 
 MIN_QTY = 0.001  # BTCUSDT Futures 最小單位
 MIN_NOTIONAL = 5  # 最小名義價值 (USDT)
@@ -59,9 +63,21 @@ def get_klines(symbol, interval, limit):
 
 
 # ===== 計算技術指標 =====
+
+
 def calculate_indicators(df):
+    """計算技術指標。
+
+    Args:
+        df: 包含 OHLC 資料的 DataFrame。
+
+    Returns:
+        DataFrame: 新增指標欄位後的 DataFrame。
+    """
     df["EMA9"] = df["close"].ewm(span=9).mean()
     df["EMA21"] = df["close"].ewm(span=21).mean()
+
+    # RSI 計算
     delta = df["close"].diff()
     gain = np.where(delta > 0, delta, 0)
     loss = np.where(delta < 0, -delta, 0)
@@ -69,6 +85,15 @@ def calculate_indicators(df):
     avg_loss = pd.Series(loss).rolling(14).mean()
     rs = avg_gain / avg_loss
     df["RSI"] = 100 - (100 / (1 + rs))
+
+    # ATR (Average True Range) 計算
+    high_low = df["high"] - df["low"]
+    high_close = np.abs(df["high"] - df["close"].shift())
+    low_close = np.abs(df["low"] - df["close"].shift())
+
+    true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    df["ATR"] = true_range.rolling(window=14).mean()
+
     return df
 
 
@@ -80,7 +105,6 @@ def get_last_m15_levels(m15_df, current_time):
 
 # ===== 產生交易訊號 =====
 def generate_signal(df_main, df_ref, balance):
-
     latest = df_main.iloc[-1]
     now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     m15_high, m15_low = get_last_m15_levels(df_ref, latest["timestamp"])
@@ -106,11 +130,27 @@ def generate_signal(df_main, df_ref, balance):
             return None
         if USE_TREND_FILTER and (m15_trend_down or m5_trend_down):
             return None
+        # print(
+        #     USE_STOP_TAKE_M15 and (m15_high <= entry_price or m15_low >= entry_price),
+        #     m15_high,
+        #     entry_price,
+        #     m15_low,
+        # )
         if USE_STOP_TAKE_M15 and (m15_high <= entry_price or m15_low >= entry_price):
             return None
         stop_loss = m15_low if USE_STOP_TAKE_M15 else latest["low"]
         take_profit = m15_high if USE_STOP_TAKE_M15 else latest["high"]
         rr = (take_profit - entry_price) / (entry_price - stop_loss)
+
+        # 根據ATR 優化stop_loss, take_profit設置ex 先判斷開倉價gap
+        if USE_SL_OPTIMIZER:
+            stop_loss = (
+                stop_loss
+                if abs(stop_loss - entry_price)
+                <= latest["ATR"] * SL_OPTIMIZER_THRESHOLD
+                else stop_loss - latest["ATR"] * SL_OPTIMIZER_THRESHOLD
+            )
+            rr = (take_profit - entry_price) / (entry_price - stop_loss)
 
         if USE_RR_FILTER and rr <= RR_THRESHOLD:
             return None
@@ -120,10 +160,11 @@ def generate_signal(df_main, df_ref, balance):
         loss_close_fee = (stop_loss * abs(position)) * MAKER_FEE_RATE
         sch_loss = (abs(stop_loss - entry_price) * position) * -1
         sch_profit = abs(take_profit - entry_price) * position
-
-        if (sch_profit - profit_close_fee - open_fee) < MIN_PROFIT:
+        if (sch_profit - profit_close_fee - open_fee) <= MIN_PROFIT:
             return None
-
+        if abs(sch_loss - loss_close_fee - open_fee) <= MAX_LOSS:
+            return None
+        # print(1)
         return {
             "signal": "LONG",
             "entry_price": entry_price,
@@ -151,6 +192,15 @@ def generate_signal(df_main, df_ref, balance):
         stop_loss = m15_high if USE_STOP_TAKE_M15 else latest["high"]
         take_profit = m15_low if USE_STOP_TAKE_M15 else latest["low"]
         rr = (entry_price - take_profit) / (stop_loss - entry_price)
+        # 根據ATR 優化stop_loss, take_profit設置ex 先判斷開倉價gap
+        if USE_SL_OPTIMIZER:
+            stop_loss = (
+                stop_loss
+                if abs(stop_loss - entry_price)
+                <= latest["ATR"] * SL_OPTIMIZER_THRESHOLD
+                else stop_loss + latest["ATR"] * SL_OPTIMIZER_THRESHOLD
+            )
+            rr = (entry_price - take_profit) / (stop_loss - entry_price)
 
         open_fee = (entry_price * abs(position)) * TAKER_FEE_RATE
         profit_close_fee = (take_profit * abs(position)) * MAKER_FEE_RATE
@@ -160,7 +210,9 @@ def generate_signal(df_main, df_ref, balance):
 
         if USE_RR_FILTER and rr <= RR_THRESHOLD:
             return None
-        if (sch_profit - profit_close_fee - open_fee) < MIN_PROFIT:
+        if (sch_profit - profit_close_fee - open_fee) <= MIN_PROFIT:
+            return None
+        if abs(sch_loss - loss_close_fee - open_fee) <= MAX_LOSS:
             return None
         return {
             "signal": "SHORT",
@@ -213,14 +265,14 @@ def notify_open(signal_info):
         f"{ret} {signal_info['signal']} 開倉 @ {signal_info['entry_price']}\n"
         f"進場時間: {signal_info['entry_time']}\n"
         f"進場價: {signal_info['entry_price']}\n"
-        f"保證金金額: {(signal_info['position']*signal_info['entry_price'])/LEVERAGE:.2f}\n"
+        f"保證金金額: {(signal_info['position'] * signal_info['entry_price']) / LEVERAGE:.2f}\n"
         f"槓桿: {LEVERAGE:.2f}\n"
         f"倉位: {signal_info['position']:.4f} BTC\n"
         f"\n"
         f"TP/SL: {signal_info['take_profit']:.2f} / {signal_info['stop_loss']:.2f}\n"
         f"PNL: {signal_info['sch_profit']:.2f} / {signal_info['sch_loss']:.2f}\n"
-        f"TP手續費預估: {signal_info['open_fee']+signal_info['profit_close_fee']:.2f} USDT\n"  # 注意：原代碼這裡沒有 \n，我建議加上以確保下一行資訊完整
-        f"SL手續費預估: {signal_info['open_fee']+signal_info['loss_close_fee']:.2f} USDT\n"  # 注意：原代碼這裡沒有 \n，我建議加上以確保下一行資訊完整
+        f"TP手續費預估: {signal_info['open_fee'] + signal_info['profit_close_fee']:.2f} USDT\n"  # 注意：原代碼這裡沒有 \n，我建議加上以確保下一行資訊完整
+        f"SL手續費預估: {signal_info['open_fee'] + signal_info['loss_close_fee']:.2f} USDT\n"  # 注意：原代碼這裡沒有 \n，我建議加上以確保下一行資訊完整
     )
     send_telegram_message(message)
 
@@ -334,7 +386,14 @@ def summarize_trade_performance(trade_list):
 
 
 # ===== 回測策略 =====
-def backtest(df_main, df_ref):
+
+
+def backtest():
+    """執行回測策略。
+
+    Returns:
+        None: 結果會印出並匯出至 Excel。
+    """
     balance = INITIAL_BALANCE
     position = 0
     entry_price = 0
@@ -344,60 +403,102 @@ def backtest(df_main, df_ref):
     entry_time = None
     trades = []
     trade_details = []
+    signal_info = None
 
-    df_ref = calculate_indicators(df_ref)
+    # 取得完整資料
+    df_main_b = get_klines(SYMBOL, INTERVAL_MAIN, BACKTEST_LIMIT)
+    df_ref_b = get_klines(SYMBOL, INTERVAL_REF, BACKTEST_LIMIT)
 
-    for i in range(21, len(df_main)):
-        latest = df_main.iloc[i]
+    df_main_b = calculate_indicators(df_main_b)
+    df_ref_b = calculate_indicators(df_ref_b)
 
-        # 平倉檢查
-        if position != 0:
+    # 從第 21 根 K 線開始回測
+    for i in range(21, len(df_main_b)):
+        current_time = df_main_b.iloc[i]["timestamp"]
+
+        # ✅ 根據當前 M5 時間,取對應的 M5 和 M15 資料
+        df_main = df_main_b[df_main_b["timestamp"] <= current_time].iloc[-22:]
+        df_ref = df_ref_b[df_ref_b["timestamp"] <= current_time].iloc[-22:]
+
+        # 檢查資料是否足夠
+        if len(df_main) < 22 or len(df_ref) < 22:
+            continue
+
+        latest = df_main.iloc[-1]
+
+        # ===== 平倉檢查 =====
+        if position != 0 and signal_info is not None:
+            exit_price = None
+
             if position > 0:  # 多單
-                if latest["low"] <= stop_loss or latest["high"] >= take_profit:
-                    pnl = (latest["close"] - entry_price) * position
-                    balance += pnl
-                    trades.append(pnl)
-                    margin = (abs(position) * entry_price) / LEVERAGE
-                    trade_details.append(
-                        {
-                            "方向": "多單",
-                            "槓桿": LEVERAGE,
-                            "開倉大小": round(abs(position), 4),
-                            "保證金": round(margin, 2),
-                            "進場時間": entry_time,
-                            "進場價格": entry_price,
-                            "出場時間": latest["timestamp"],
-                            "出場價格": latest["close"],
-                            "盈虧": round(pnl, 2),
-                            "RR": rr,
-                        }
-                    )
-                    position = 0
-            else:  # 空單
-                if latest["high"] >= stop_loss or latest["low"] <= take_profit:
-                    pnl = (entry_price - latest["close"]) * abs(position)
-                    balance += pnl
-                    trades.append(pnl)
-                    margin = (abs(position) * entry_price) / LEVERAGE
-                    trade_details.append(
-                        {
-                            "方向": "空單",
-                            "槓桿": LEVERAGE,
-                            "開倉大小": round(abs(position), 4),
-                            "保證金": round(margin, 2),
-                            "進場時間": entry_time,
-                            "進場價格": entry_price,
-                            "出場時間": latest["timestamp"],
-                            "出場價格": latest["close"],
-                            "盈虧": round(pnl, 2),
-                            "RR": rr,
-                        }
-                    )
-                    position = 0
+                if latest["low"] <= stop_loss:
+                    exit_price = stop_loss
+                elif latest["high"] >= take_profit:
+                    exit_price = take_profit
 
-        # 開倉條件
+                if exit_price:
+                    pnl = (exit_price - entry_price) * position
+
+            else:  # 空單
+                if latest["high"] >= stop_loss:
+                    exit_price = stop_loss
+                elif latest["low"] <= take_profit:
+                    exit_price = take_profit
+
+                if exit_price:
+                    pnl = (entry_price - exit_price) * abs(position)
+
+            # 處理平倉
+            if exit_price:
+                signal_info["close_price"] = exit_price
+
+                # 手續費計算
+                open_fee = signal_info["open_fee"]
+                close_fee = (exit_price * abs(position)) * TAKER_FEE_RATE
+                signal_info["close_fee"] = close_fee
+                total_fee = open_fee + close_fee
+                signal_info["total_fee"] = total_fee
+
+                # 淨損益
+                net_pnl = pnl - total_fee
+                signal_info["net_pnl"] = net_pnl
+                signal_info["pnl"] = pnl
+                signal_info["close_time"] = latest["timestamp"]
+
+                # 更新餘額
+                margin = (abs(position) * entry_price) / LEVERAGE
+                balance = balance + margin + net_pnl
+                signal_info["balance"] = balance
+
+                # 記錄交易
+                trades.append(net_pnl)
+                trade_details.append(
+                    {
+                        "方向": "多單" if position > 0 else "空單",
+                        "槓桿": LEVERAGE,
+                        "開倉大小": round(abs(position), 4),
+                        "保證金": round(margin, 2),
+                        "進場時間": entry_time,
+                        "進場價格": entry_price,
+                        "出場時間": latest["timestamp"],
+                        "出場價格": exit_price,
+                        "盈虧": round(pnl, 2),
+                        "淨盈虧": round(net_pnl, 2),
+                        "手續費": round(total_fee, 2),
+                        "RR": rr,
+                        "balance": round(balance, 2),  # ✅ 新增
+                    }
+                )
+                position = 0
+                signal_info = None
+
+                if balance <= 0:
+                    print(f"餘額不足,無法繼續開倉")
+                    break
+
+        # ===== 開倉條件 =====
         if position == 0:
-            signal_info = generate_signal(latest, df_ref)
+            signal_info = generate_signal(df_main, df_ref, balance)
             if signal_info:
                 entry_price = signal_info["entry_price"]
                 stop_loss = signal_info["stop_loss"]
@@ -405,12 +506,61 @@ def backtest(df_main, df_ref):
                 rr = signal_info["rr"]
                 entry_time = latest["timestamp"]
                 position = (
-                    (balance * LEVERAGE) / entry_price
+                    signal_info["position"]
                     if signal_info["signal"] == "LONG"
-                    else -(balance * LEVERAGE) / entry_price
+                    else -signal_info["position"]
                 )
 
-    # 統計結果
+                # 扣除保證金
+                margin = (abs(position) * entry_price) / LEVERAGE
+
+                if balance < margin:
+                    print(
+                        f"⚠️ 餘額不足,無法開倉 (需要 {margin:.2f} USDT,剩餘 {balance:.2f} USDT)"
+                    )
+                    signal_info = None
+                    continue
+
+                balance -= margin
+
+    # ===== 處理最後未平倉的持倉 =====
+    if position != 0 and signal_info is not None:
+        exit_price = df_main_b.iloc[-1]["close"]
+
+        if position > 0:
+            pnl = (exit_price - entry_price) * position
+        else:
+            pnl = (entry_price - exit_price) * abs(position)
+
+        open_fee = signal_info["open_fee"]
+        close_fee = (exit_price * abs(position)) * TAKER_FEE_RATE
+        total_fee = open_fee + close_fee
+        net_pnl = pnl - total_fee
+
+        margin = (abs(position) * entry_price) / LEVERAGE
+        balance = balance + margin + net_pnl
+
+        trades.append(net_pnl)
+        trade_details.append(
+            {
+                "方向": "多單" if position > 0 else "空單",
+                "槓桿": LEVERAGE,
+                "開倉大小": round(abs(position), 4),
+                "保證金": round(margin, 2),
+                "進場時間": entry_time,
+                "進場價格": entry_price,
+                "出場時間": df_main_b.iloc[-1]["timestamp"],
+                "出場價格": exit_price,
+                "盈虧": round(pnl, 2),
+                "淨盈虧": round(net_pnl, 2),
+                "手續費": round(total_fee, 2),
+                "RR": rr,
+                "balance": round(balance, 2),  # ✅ 新增
+            }
+        )
+        print(f"⚠️ 回測結束時強制平倉: 出場價={exit_price}, 淨盈虧={net_pnl:.2f} USDT")
+
+    # ===== 統計結果 =====
     win_trades = [t for t in trades if t > 0]
     lose_trades = [t for t in trades if t <= 0]
     win_rate = len(win_trades) / len(trades) * 100 if trades else 0
@@ -421,13 +571,13 @@ def backtest(df_main, df_ref):
     print(f"初始資金: {INITIAL_BALANCE} USDT")
     print(f"槓桿倍數: {LEVERAGE}x")
     print(f"最終資金: {balance:.2f} USDT")
-    print(f"總盈虧: {total_pnl:.2f} USDT")
+    print(f"總淨盈虧: {total_pnl:.2f} USDT")
     print(f"交易次數: {len(trades)}")
     print(f"勝率: {win_rate:.2f}%")
     print(f"最大單筆虧損: {max_drawdown:.2f} USDT")
 
     trade_df = pd.DataFrame(trade_details)
-    trade_df.to_excel("trade_df.xlsx")
+    trade_df.to_excel("trade_df.xlsx", index=False)
     print("交易明細已匯出至 trade_df.xlsx")
 
 
@@ -601,17 +751,17 @@ def pratical_scanner():
                 notify_close_Bot(trade)
                 break
             time.sleep(0.3)
+
         except Exception as e:
             print("錯誤:", e)
             time.sleep(15)
 
 
 # ===== 執行回測 =====
-# df_main = get_klines(SYMBOL, INTERVAL_MAIN, LIMIT)
-# df_ref = get_klines(SYMBOL, INTERVAL_REF, LIMIT)
-# df_main = calculate_indicators(df_main)
-# backtest(df_main, df_ref)
+backtest()
 
 # ===== 執行實盤 =====
-pratical_scanner()
+# pratical_scanner()
+
+
 # send_telegram_message("hi")
