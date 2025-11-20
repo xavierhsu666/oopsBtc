@@ -32,6 +32,8 @@ MAX_LOSS = INITIAL_BALANCE * 0.165  # 最大虧損
 TELEGRAM_TOKEN = "8311467265:AAHRI8fd7xHgx4HZH4FEBQ78vCx9wwsc6w0"
 CHAT_ID = "1188811502"
 
+MAX_SPREAD = 0.2
+
 
 # ===== 取得歷史K線資料 =====
 def get_klines(symbol, interval, limit):
@@ -64,19 +66,30 @@ def get_klines(symbol, interval, limit):
 # ===== 計算技術指標 =====
 
 
+
 def calculate_indicators(df):
-    """計算技術指標。
+    """
+    計算技術指標，適用於高頻交易策略。
 
     Args:
-        df: 包含 OHLC 資料的 DataFrame。
+        df: 包含 OHLC 資料的 DataFrame，需包含 columns: ['timestamp','open','high','low','close','volume']
 
     Returns:
         DataFrame: 新增指標欄位後的 DataFrame。
     """
-    df["EMA9"] = df["close"].ewm(span=9).mean()
-    df["EMA21"] = df["close"].ewm(span=21).mean()
+    # 確保數值型態
+    numeric_cols = ["open", "high", "low", "close", "volume"]
+    for col in numeric_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df.dropna(subset=numeric_cols, inplace=True)
 
-    # RSI 計算
+    # EMA 快速均線
+    df["EMA3"] = df["close"].ewm(span=3, adjust=False).mean()
+    df["EMA8"] = df["close"].ewm(span=8, adjust=False).mean()
+    df["EMA9"] = df["close"].ewm(span=9, adjust=False).mean()
+    df["EMA21"] = df["close"].ewm(span=21, adjust=False).mean()
+
+    # RSI (14)
     delta = df["close"].diff()
     gain = np.where(delta > 0, delta, 0)
     loss = np.where(delta < 0, -delta, 0)
@@ -85,15 +98,26 @@ def calculate_indicators(df):
     rs = avg_gain / avg_loss
     df["RSI"] = 100 - (100 / (1 + rs))
 
-    # ATR (Average True Range) 計算
+    # ATR (14)
     high_low = df["high"] - df["low"]
     high_close = np.abs(df["high"] - df["close"].shift())
     low_close = np.abs(df["low"] - df["close"].shift())
-
     true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df["ATR"] = true_range.rolling(window=14).mean()
 
+    # VWAP (成交量加權平均價)
+    df["cum_vol"] = df["volume"].cumsum()
+    df["cum_vol_price"] = (df["close"] * df["volume"]).cumsum()
+    df["VWAP"] = df["cum_vol_price"] / df["cum_vol"]
+
+    # Spread (假設有 bid/ask 資料，否則用 high-low 當近似值)
+    df["spread"] = (df["high"] - df["low"]) / df["close"] * 100  # 百分比
+
+    # 成交量均值 (用於檢測 Volume Spike)
+    df["vol_ma10"] = df["volume"].rolling(10).mean()
+
     return df
+
 
 
 # ===== 找最近一根 M15 的高低 =====
@@ -279,6 +303,80 @@ def generate_signal(df_main, df_ref, balance):
             "loss_close_fee": loss_close_fee,
             "entry_time": now,
             "position": position,
+        }
+
+    return None
+
+
+def generate_scalping_signal(df_main, balance):
+    latest = df_main.iloc[-1]
+    now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # 超短均線判斷
+    trend_up = latest["EMA3"] > latest["EMA8"]
+    trend_down = latest["EMA3"] < latest["EMA8"]
+
+    # VWAP過濾：避免追高殺低
+    price_above_vwap = latest["close"] > latest["VWAP"]
+    price_below_vwap = latest["close"] < latest["VWAP"]
+
+    # 成交量過濾：避免假突破
+    vol_spike = latest["volume"] > df_main["volume"].rolling(10).mean().iloc[-1] * 1.5
+
+    # 檢查滑點（Spread）
+    if latest["spread"] > MAX_SPREAD:  # 例如 0.02%
+        return None
+
+    entry_price = latest["close"]
+    position = (balance * LEVERAGE) / entry_price
+    position = adjust_position_size(position, entry_price)
+
+    # 固定止損與獲利距離（高頻交易特性）
+    stop_loss = entry_price * (1 - 0.0005) if trend_up else entry_price * (1 + 0.0005)
+    take_profit = entry_price * (1 + 0.001) if trend_up else entry_price * (1 - 0.001)
+
+    rr = abs(take_profit - entry_price) / abs(entry_price - stop_loss)
+
+    # 條件判斷
+    if trend_up and price_above_vwap and vol_spike:
+        open_fee = (entry_price * abs(position)) * TAKER_FEE_RATE
+        profit_close_fee = (take_profit * abs(position)) * MAKER_FEE_RATE
+        loss_close_fee = (stop_loss * abs(position)) * MAKER_FEE_RATE
+        sch_loss = (abs(stop_loss - entry_price) * position) * -1
+        sch_profit = abs(take_profit - entry_price) * position
+        return {
+            "signal": "LONG",
+            "entry_price": entry_price,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "rr": rr,
+            "entry_time": now,
+            "position": position,
+            "open_fee": open_fee,
+            "profit_close_fee": profit_close_fee,
+            "loss_close_fee": loss_close_fee,
+            "sch_loss": sch_loss,
+            "sch_profit": sch_profit,
+        }
+    elif trend_down and price_below_vwap and vol_spike:
+        open_fee = (entry_price * abs(position)) * TAKER_FEE_RATE
+        profit_close_fee = (take_profit * abs(position)) * MAKER_FEE_RATE
+        loss_close_fee = (stop_loss * abs(position)) * MAKER_FEE_RATE
+        sch_loss = (abs(stop_loss - entry_price) * position) * -1
+        sch_profit = abs(take_profit - entry_price) * position
+        return {
+            "signal": "SHORT",
+            "entry_price": entry_price,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "rr": rr,
+            "entry_time": now,
+            "position": position,
+            "open_fee": open_fee,
+            "profit_close_fee": profit_close_fee,
+            "loss_close_fee": loss_close_fee,
+            "sch_loss": sch_loss,
+            "sch_profit": sch_profit,
         }
 
     return None
@@ -550,7 +648,9 @@ def backtest():
 
         # ===== 開倉條件 =====
         if position == 0:
-            signal_info = generate_signal(df_main, df_ref, balance)
+            # signal_info = generate_signal(df_main, df_ref, balance)
+            signal_info = generate_scalping_signal(df_main, balance)
+
             if signal_info:
                 entry_price = signal_info["entry_price"]
                 stop_loss = signal_info["stop_loss"]
@@ -679,7 +779,9 @@ def pratical_scanner():
             df_ref = calculate_indicators(df_ref)
 
             latest = df_main.iloc[-1]
-            signal_info = generate_signal(df_main, df_ref, balance)
+            # signal_info = generate_signal(df_main, df_ref, balance)
+            signal_info = generate_scalping_signal(df_main, balance)
+
 
             trend = "UP" if latest["EMA9"] > latest["EMA21"] else "DOWN"
             print(
@@ -1046,7 +1148,9 @@ def backtest_with_return():
 
         # 開倉條件
         if position == 0:
-            signal_info = generate_signal(df_main, df_ref, balance)
+            # signal_info = generate_signal(df_main, df_ref, balance)
+            signal_info = generate_scalping_signal(df_main, balance)
+
             if signal_info:
                 entry_price = signal_info["entry_price"]
                 stop_loss = signal_info["stop_loss"]
@@ -1117,10 +1221,10 @@ def backtest_with_return():
 # ===== 執行回測參數優化 =====
 # best_params = optimize_parameters()
 # ===== 執行回測 =====
-# backtest()
+backtest()
 
 # ===== 執行實盤 =====
-pratical_scanner()
+# pratical_scanner()
 
 
 # send_telegram_message("hi")
