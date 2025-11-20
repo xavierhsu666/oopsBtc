@@ -10,25 +10,24 @@ SYMBOL = "BTCUSDT"
 INTERVAL_MAIN = "5m"
 INTERVAL_REF = "15m"
 LIMIT = 100
-BACKTEST_LIMIT = 1000
+BACKTEST_LIMIT = 500
 
 INITIAL_BALANCE = 100  # 初始資金
 LEVERAGE = 15  # 槓桿倍數
-RR_THRESHOLD = 1.5  # RR 條件
+RR_THRESHOLD = 1.8  # RR 條件
+TAKER_FEE_RATE = 0.0005  # 吃單方(市價單)
+MAKER_FEE_RATE = 0.0002  # 掛單方(限價單)
+MIN_QTY = 0.001  # BTCUSDT Futures 最小單位
+MIN_NOTIONAL = 5  # 最小名義價值 (USDT)
 
 USE_RSI_FILTER = True  # 是否啟用 RSI 過濾
 USE_TREND_FILTER = True  # 是否啟用順勢條件
 USE_RR_FILTER = True  # 是否啟用 RR 條件
 USE_STOP_TAKE_M15 = True  # 是否使用 M15 高低作為止盈止損
 USE_SL_OPTIMIZER = True  # 是否根據ATR使用SL優化器
-SL_OPTIMIZER_THRESHOLD = 0.3  # ATR - SL優化器 TH
-TAKER_FEE_RATE = 0.0005  # 吃單方(市價單)
-MAKER_FEE_RATE = 0.0002  # 掛單方(限價單)
-MIN_PROFIT = 0.5
-MAX_LOSS = INITIAL_BALANCE * 0.02
-
-MIN_QTY = 0.001  # BTCUSDT Futures 最小單位
-MIN_NOTIONAL = 5  # 最小名義價值 (USDT)
+SL_OPTIMIZER_THRESHOLD = 0.2  # ATR - SL優化器 TH
+MIN_PROFIT = 0.5  # 最小獲利
+MAX_LOSS = INITIAL_BALANCE * 0.165  # 最大虧損
 
 TELEGRAM_TOKEN = "8311467265:AAHRI8fd7xHgx4HZH4FEBQ78vCx9wwsc6w0"
 CHAT_ID = "1188811502"
@@ -127,9 +126,10 @@ def generate_signal(df_main, df_ref, balance):
     # 多單
     if latest["EMA9"] > latest["EMA21"]:
         if USE_RSI_FILTER and latest["RSI"] >= 70:
-            print(f"LONG RSI 過濾>=70: {latest['RSI']} 不做交易")
+            # print(f"LONG RSI 過濾>=70: {latest['RSI']} 不做交易")
             return None
-        if USE_TREND_FILTER and (m15_trend_down or m5_trend_down):
+        # if USE_TREND_FILTER and (m15_trend_down or m5_trend_down):
+        if USE_TREND_FILTER and (m5_trend_down):
             print(
                 f"LONG Trend Filter 順勢單: M5Down={m5_trend_down}, M15Down={m15_trend_down} 不做交易"
             )
@@ -140,14 +140,12 @@ def generate_signal(df_main, df_ref, balance):
         #     entry_price,
         #     m15_low,
         # )
-        if USE_STOP_TAKE_M15 and (m15_high <= entry_price or m15_low >= entry_price):
-            print(
-                f"LONG USE_STOP_TAKE_M15 價格不再區間內 low-entry-high: {m15_low}-{entry_price}-{m15_high} 不做交易"
-            )
-            return None
         stop_loss = m15_low if USE_STOP_TAKE_M15 else latest["low"]
         take_profit = m15_high if USE_STOP_TAKE_M15 else latest["high"]
-        rr = (take_profit - entry_price) / (entry_price - stop_loss)
+        if (stop_loss - entry_price) == 0:
+            rr = 0
+        else:
+            rr = (take_profit - entry_price) / (entry_price - stop_loss)
 
         # 根據ATR 優化stop_loss, take_profit設置ex 先判斷開倉價gap
         if USE_SL_OPTIMIZER:
@@ -157,10 +155,21 @@ def generate_signal(df_main, df_ref, balance):
                 <= latest["ATR"] * SL_OPTIMIZER_THRESHOLD
                 else stop_loss - latest["ATR"] * SL_OPTIMIZER_THRESHOLD
             )
-            rr = (take_profit - entry_price) / (entry_price - stop_loss)
+            if (stop_loss - entry_price) == 0:
+                rr = 0
+            else:
+                rr = (take_profit - entry_price) / (entry_price - stop_loss)
+
+        if USE_STOP_TAKE_M15 and (
+            take_profit <= entry_price or stop_loss >= entry_price
+        ):
+            # print(
+            #     f"LONG USE_STOP_TAKE_M15 價格不再區間內 stop_loss-entry-take_profit: {stop_loss:.2F}-{entry_price:.2F}-{take_profit:.2F} 不做交易"
+            # )
+            return None
 
         if USE_RR_FILTER and rr <= RR_THRESHOLD:
-            print(f"LONG RR 過濾<={RR_THRESHOLD}: {rr} 不做交易")
+            # print(f"LONG RR 過濾<={RR_THRESHOLD}: {rr:.2f} 不做交易")
             return None
 
         open_fee = (entry_price * abs(position)) * TAKER_FEE_RATE
@@ -169,14 +178,14 @@ def generate_signal(df_main, df_ref, balance):
         sch_loss = (abs(stop_loss - entry_price) * position) * -1
         sch_profit = abs(take_profit - entry_price) * position
         if (sch_profit - profit_close_fee - open_fee) <= MIN_PROFIT:
-            print(
-                f"LONG MIN_PROFIT<={MIN_PROFIT}: {sch_profit - profit_close_fee - open_fee} 不做交易"
-            )
+            # print(
+            #     f"LONG MIN_PROFIT<={MIN_PROFIT}: {(sch_profit - profit_close_fee - open_fee):.2f} 不做交易"
+            # )
             return None
-        if abs(sch_loss - loss_close_fee - open_fee) <= MAX_LOSS:
-            print(
-                f"LONG MAX_LOSS<={MAX_LOSS}: {sch_loss - loss_close_fee - open_fee} 不做交易"
-            )
+        if abs(sch_loss - loss_close_fee - open_fee) >= MAX_LOSS:
+            # print(
+            #     f"LONG MAX_LOSS>={MAX_LOSS}: {abs(sch_loss - loss_close_fee - open_fee):.2F} 不做交易"
+            # )
             return None
         # print(1)
         return {
@@ -197,22 +206,21 @@ def generate_signal(df_main, df_ref, balance):
     # 空單
     elif latest["EMA9"] < latest["EMA21"]:
         if USE_RSI_FILTER and latest["RSI"] <= 30:
-            print(f"SHORT RSI 過濾<=30: {latest['RSI']} 不做交易")
+            # print(f"SHORT RSI 過濾<=30: {latest['RSI']} 不做交易")
             return None
-        if USE_TREND_FILTER and (m15_trend_up or m5_trend_up):
+        # if USE_TREND_FILTER and (m15_trend_up or m5_trend_up):
+        if USE_TREND_FILTER and (m5_trend_up):
             print(
-                f"SHORT Trend Filter 順勢單: M5UP={m15_trend_up}, M15UP={m5_trend_up} 不做交易"
+                f"SHORT Trend Filter 順勢單: M5UP={m5_trend_up}, M15UP={m15_trend_up} 不做交易"
             )
             return None
         entry_price = latest["close"]
-        if USE_STOP_TAKE_M15 and (m15_low >= entry_price or m15_high <= entry_price):
-            print(
-                f"SHORT USE_STOP_TAKE_M15 價格不再區間內 low-entry-high: {m15_low}-{entry_price}-{m15_high} 不做交易"
-            )
-            return None
         stop_loss = m15_high if USE_STOP_TAKE_M15 else latest["high"]
         take_profit = m15_low if USE_STOP_TAKE_M15 else latest["low"]
-        rr = (entry_price - take_profit) / (stop_loss - entry_price)
+        if (stop_loss - entry_price) == 0:
+            rr = 0
+        else:
+            rr = (entry_price - take_profit) / (stop_loss - entry_price)
         # 根據ATR 優化stop_loss, take_profit設置ex 先判斷開倉價gap
         if USE_SL_OPTIMIZER:
             stop_loss = (
@@ -221,7 +229,23 @@ def generate_signal(df_main, df_ref, balance):
                 <= latest["ATR"] * SL_OPTIMIZER_THRESHOLD
                 else stop_loss + latest["ATR"] * SL_OPTIMIZER_THRESHOLD
             )
-            rr = (entry_price - take_profit) / (stop_loss - entry_price)
+            if (stop_loss - entry_price) == 0:
+                rr = 0
+            else:
+                rr = (entry_price - take_profit) / (stop_loss - entry_price)
+        if USE_STOP_TAKE_M15 and (
+            take_profit >= entry_price or stop_loss <= entry_price
+        ):
+            # if take_profit >= entry_price:
+            #     print(
+            #         f"SHORT USE_STOP_TAKE_M15(TP>=ENTRY) 價格不再區間內 entry-take_profit: {entry_price:.2F}-{take_profit:.2F} 不做交易"
+            #     )
+            # elif stop_loss <= entry_price:
+            #     print(
+            #         f"SHORT USE_STOP_TAKE_M15(SL<=ENTRY) 價格不再區間內 stop_loss-entry: {stop_loss:.2F}-{entry_price:.2F} 不做交易"
+            #     )
+
+            return None
 
         open_fee = (entry_price * abs(position)) * TAKER_FEE_RATE
         profit_close_fee = (take_profit * abs(position)) * MAKER_FEE_RATE
@@ -230,17 +254,17 @@ def generate_signal(df_main, df_ref, balance):
         sch_profit = abs(take_profit - entry_price) * position
 
         if USE_RR_FILTER and rr <= RR_THRESHOLD:
-            print(f"SHORT RR 過濾<={RR_THRESHOLD}: {rr} 不做交易")
+            # print(f"SHORT RR 過濾<={RR_THRESHOLD}: {rr:.2f} 不做交易")
             return None
         if (sch_profit - profit_close_fee - open_fee) <= MIN_PROFIT:
-            print(
-                f"SHORT MIN_PROFIT<={MIN_PROFIT}: {sch_profit - profit_close_fee - open_fee} 不做交易"
-            )
+            # print(
+            #     f"SHORT MIN_PROFIT<={MIN_PROFIT}: {(sch_profit - profit_close_fee - open_fee):.2f} 不做交易"
+            # )
             return None
-        if abs(sch_loss - loss_close_fee - open_fee) <= MAX_LOSS:
-            print(
-                f"SHORT MAX_LOSS<={MAX_LOSS}: {sch_loss - loss_close_fee - open_fee} 不做交易"
-            )
+        if abs(sch_loss - loss_close_fee - open_fee) >= MAX_LOSS:
+            # print(
+            #     f"SHORT MAX_LOSS>={MAX_LOSS}: {abs(sch_loss - loss_close_fee - open_fee):.2F} 不做交易"
+            # )
             return None
         return {
             "signal": "SHORT",
