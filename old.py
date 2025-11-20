@@ -127,8 +127,12 @@ def generate_signal(df_main, df_ref, balance):
     # 多單
     if latest["EMA9"] > latest["EMA21"]:
         if USE_RSI_FILTER and latest["RSI"] >= 70:
+            print(f"LONG RSI 過濾>=70: {latest['RSI']} 不做交易")
             return None
         if USE_TREND_FILTER and (m15_trend_down or m5_trend_down):
+            print(
+                f"LONG Trend Filter 順勢單: M5Down={m5_trend_down}, M15Down={m15_trend_down} 不做交易"
+            )
             return None
         # print(
         #     USE_STOP_TAKE_M15 and (m15_high <= entry_price or m15_low >= entry_price),
@@ -137,6 +141,9 @@ def generate_signal(df_main, df_ref, balance):
         #     m15_low,
         # )
         if USE_STOP_TAKE_M15 and (m15_high <= entry_price or m15_low >= entry_price):
+            print(
+                f"LONG USE_STOP_TAKE_M15 價格不再區間內 low-entry-high: {m15_low}-{entry_price}-{m15_high} 不做交易"
+            )
             return None
         stop_loss = m15_low if USE_STOP_TAKE_M15 else latest["low"]
         take_profit = m15_high if USE_STOP_TAKE_M15 else latest["high"]
@@ -153,6 +160,7 @@ def generate_signal(df_main, df_ref, balance):
             rr = (take_profit - entry_price) / (entry_price - stop_loss)
 
         if USE_RR_FILTER and rr <= RR_THRESHOLD:
+            print(f"LONG RR 過濾<={RR_THRESHOLD}: {rr} 不做交易")
             return None
 
         open_fee = (entry_price * abs(position)) * TAKER_FEE_RATE
@@ -161,8 +169,14 @@ def generate_signal(df_main, df_ref, balance):
         sch_loss = (abs(stop_loss - entry_price) * position) * -1
         sch_profit = abs(take_profit - entry_price) * position
         if (sch_profit - profit_close_fee - open_fee) <= MIN_PROFIT:
+            print(
+                f"LONG MIN_PROFIT<={MIN_PROFIT}: {sch_profit - profit_close_fee - open_fee} 不做交易"
+            )
             return None
         if abs(sch_loss - loss_close_fee - open_fee) <= MAX_LOSS:
+            print(
+                f"LONG MAX_LOSS<={MAX_LOSS}: {sch_loss - loss_close_fee - open_fee} 不做交易"
+            )
             return None
         # print(1)
         return {
@@ -183,11 +197,18 @@ def generate_signal(df_main, df_ref, balance):
     # 空單
     elif latest["EMA9"] < latest["EMA21"]:
         if USE_RSI_FILTER and latest["RSI"] <= 30:
+            print(f"SHORT RSI 過濾<=30: {latest['RSI']} 不做交易")
             return None
         if USE_TREND_FILTER and (m15_trend_up or m5_trend_up):
+            print(
+                f"SHORT Trend Filter 順勢單: M5UP={m15_trend_up}, M15UP={m5_trend_up} 不做交易"
+            )
             return None
         entry_price = latest["close"]
         if USE_STOP_TAKE_M15 and (m15_low >= entry_price or m15_high <= entry_price):
+            print(
+                f"SHORT USE_STOP_TAKE_M15 價格不再區間內 low-entry-high: {m15_low}-{entry_price}-{m15_high} 不做交易"
+            )
             return None
         stop_loss = m15_high if USE_STOP_TAKE_M15 else latest["high"]
         take_profit = m15_low if USE_STOP_TAKE_M15 else latest["low"]
@@ -209,10 +230,17 @@ def generate_signal(df_main, df_ref, balance):
         sch_profit = abs(take_profit - entry_price) * position
 
         if USE_RR_FILTER and rr <= RR_THRESHOLD:
+            print(f"SHORT RR 過濾<={RR_THRESHOLD}: {rr} 不做交易")
             return None
         if (sch_profit - profit_close_fee - open_fee) <= MIN_PROFIT:
+            print(
+                f"SHORT MIN_PROFIT<={MIN_PROFIT}: {sch_profit - profit_close_fee - open_fee} 不做交易"
+            )
             return None
         if abs(sch_loss - loss_close_fee - open_fee) <= MAX_LOSS:
+            print(
+                f"SHORT MAX_LOSS<={MAX_LOSS}: {sch_loss - loss_close_fee - open_fee} 不做交易"
+            )
             return None
         return {
             "signal": "SHORT",
