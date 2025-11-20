@@ -10,22 +10,24 @@ SYMBOL = "BTCUSDT"
 INTERVAL_MAIN = "5m"
 INTERVAL_REF = "15m"
 LIMIT = 100
-BACKTEST_LIMIT = 500
+BACKTEST_LIMIT = 1000
 
 INITIAL_BALANCE = 100  # 初始資金
 LEVERAGE = 15  # 槓桿倍數
-RR_THRESHOLD = 1.8  # RR 條件
+RR_THRESHOLD_MIN = 1.4  # MIN RR 條件
+RR_THRESHOLD_MAX = 5  # MAX RR 條件
 TAKER_FEE_RATE = 0.0005  # 吃單方(市價單)
 MAKER_FEE_RATE = 0.0002  # 掛單方(限價單)
 MIN_QTY = 0.001  # BTCUSDT Futures 最小單位
 MIN_NOTIONAL = 5  # 最小名義價值 (USDT)
+ROLLING_NUM = 3 #抓移動max min當TP SL
 
 USE_RSI_FILTER = True  # 是否啟用 RSI 過濾
 USE_TREND_FILTER = True  # 是否啟用順勢條件
 USE_RR_FILTER = True  # 是否啟用 RR 條件
-USE_STOP_TAKE_M15 = True  # 是否使用 M15 高低作為止盈止損
+USE_STOP_TAKE_M15 = True  # 是否使用 M15 高低作為止盈止損 FALSE 則使用ROLLING HIGH AND LOW
 USE_SL_OPTIMIZER = True  # 是否根據ATR使用SL優化器
-SL_OPTIMIZER_THRESHOLD = 0.2  # ATR - SL優化器 TH
+SL_OPTIMIZER_THRESHOLD = 0.3  # ATR - SL優化器 TH
 MIN_PROFIT = 0.5  # 最小獲利
 MAX_LOSS = INITIAL_BALANCE * 0.165  # 最大虧損
 
@@ -93,6 +95,10 @@ def calculate_indicators(df):
     true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df["ATR"] = true_range.rolling(window=14).mean()
 
+    # 前n筆的最高價和最低價
+    df["max_high_n"] = df["high"].rolling(window=ROLLING_NUM).max()
+    df["min_low_n"] = df["low"].rolling(window=ROLLING_NUM).min()
+
     return df
 
 
@@ -126,23 +132,17 @@ def generate_signal(df_main, df_ref, balance):
     # 多單
     if latest["EMA9"] > latest["EMA21"]:
         if USE_RSI_FILTER and latest["RSI"] >= 70:
-            # print(f"LONG RSI 過濾>=70: {latest['RSI']} 不做交易")
+            print(f"LONG RSI 過濾>=70: {latest['RSI']} 不做交易")
             return None
-        # if USE_TREND_FILTER and (m15_trend_down or m5_trend_down):
-        if USE_TREND_FILTER and (m5_trend_down):
+        # if USE_TREND_FILTER and not (m15_trend_up and m5_trend_up):
+        if USE_TREND_FILTER and not (m5_trend_up):
             print(
                 f"LONG Trend Filter 順勢單: M5Down={m5_trend_down}, M15Down={m15_trend_down} 不做交易"
             )
             return None
-        # print(
-        #     USE_STOP_TAKE_M15 and (m15_high <= entry_price or m15_low >= entry_price),
-        #     m15_high,
-        #     entry_price,
-        #     m15_low,
-        # )
-        stop_loss = m15_low if USE_STOP_TAKE_M15 else latest["low"]
-        take_profit = m15_high if USE_STOP_TAKE_M15 else latest["high"]
-        if (stop_loss - entry_price) == 0:
+        stop_loss = m15_low if USE_STOP_TAKE_M15 else latest["min_low_n"]
+        take_profit = m15_high if USE_STOP_TAKE_M15 else latest["max_high_n"]
+        if abs(stop_loss - entry_price) == 0:
             rr = 0
         else:
             rr = (take_profit - entry_price) / (entry_price - stop_loss)
@@ -155,7 +155,7 @@ def generate_signal(df_main, df_ref, balance):
                 <= latest["ATR"] * SL_OPTIMIZER_THRESHOLD
                 else stop_loss - latest["ATR"] * SL_OPTIMIZER_THRESHOLD
             )
-            if (stop_loss - entry_price) == 0:
+            if abs(stop_loss - entry_price) == 0:
                 rr = 0
             else:
                 rr = (take_profit - entry_price) / (entry_price - stop_loss)
@@ -163,13 +163,15 @@ def generate_signal(df_main, df_ref, balance):
         if USE_STOP_TAKE_M15 and (
             take_profit <= entry_price or stop_loss >= entry_price
         ):
-            # print(
-            #     f"LONG USE_STOP_TAKE_M15 價格不再區間內 stop_loss-entry-take_profit: {stop_loss:.2F}-{entry_price:.2F}-{take_profit:.2F} 不做交易"
-            # )
+            print(
+                f"LONG USE_STOP_TAKE_M15 價格不再區間內 stop_loss-entry-take_profit: {stop_loss:.2F}-{entry_price:.2F}-{take_profit:.2F} 不做交易"
+            )
             return None
 
-        if USE_RR_FILTER and rr <= RR_THRESHOLD:
-            # print(f"LONG RR 過濾<={RR_THRESHOLD}: {rr:.2f} 不做交易")
+        if USE_RR_FILTER and not (rr <= RR_THRESHOLD_MAX and rr >= RR_THRESHOLD_MIN):
+            print(
+                f"SHORT RR 不再({RR_THRESHOLD_MIN},{RR_THRESHOLD_MAX}): {rr:.2f} 不做交易"
+            )
             return None
 
         open_fee = (entry_price * abs(position)) * TAKER_FEE_RATE
@@ -178,14 +180,14 @@ def generate_signal(df_main, df_ref, balance):
         sch_loss = (abs(stop_loss - entry_price) * position) * -1
         sch_profit = abs(take_profit - entry_price) * position
         if (sch_profit - profit_close_fee - open_fee) <= MIN_PROFIT:
-            # print(
-            #     f"LONG MIN_PROFIT<={MIN_PROFIT}: {(sch_profit - profit_close_fee - open_fee):.2f} 不做交易"
-            # )
+            print(
+                f"LONG MIN_PROFIT<={MIN_PROFIT}: {(sch_profit - profit_close_fee - open_fee):.2f} 不做交易"
+            )
             return None
         if abs(sch_loss - loss_close_fee - open_fee) >= MAX_LOSS:
-            # print(
-            #     f"LONG MAX_LOSS>={MAX_LOSS}: {abs(sch_loss - loss_close_fee - open_fee):.2F} 不做交易"
-            # )
+            print(
+                f"LONG MAX_LOSS>={MAX_LOSS}: {abs(sch_loss - loss_close_fee - open_fee):.2F} 不做交易"
+            )
             return None
         # print(1)
         return {
@@ -208,16 +210,16 @@ def generate_signal(df_main, df_ref, balance):
         if USE_RSI_FILTER and latest["RSI"] <= 30:
             # print(f"SHORT RSI 過濾<=30: {latest['RSI']} 不做交易")
             return None
-        # if USE_TREND_FILTER and (m15_trend_up or m5_trend_up):
-        if USE_TREND_FILTER and (m5_trend_up):
+        # if USE_TREND_FILTER and not (m15_trend_down and m5_trend_down):
+        if USE_TREND_FILTER and not (m5_trend_down):
             print(
                 f"SHORT Trend Filter 順勢單: M5UP={m5_trend_up}, M15UP={m15_trend_up} 不做交易"
             )
             return None
         entry_price = latest["close"]
-        stop_loss = m15_high if USE_STOP_TAKE_M15 else latest["high"]
-        take_profit = m15_low if USE_STOP_TAKE_M15 else latest["low"]
-        if (stop_loss - entry_price) == 0:
+        stop_loss = m15_high if USE_STOP_TAKE_M15 else latest["max_high_n"]
+        take_profit = m15_low if USE_STOP_TAKE_M15 else latest["min_low_n"]
+        if abs(stop_loss - entry_price) == 0:
             rr = 0
         else:
             rr = (entry_price - take_profit) / (stop_loss - entry_price)
@@ -229,21 +231,21 @@ def generate_signal(df_main, df_ref, balance):
                 <= latest["ATR"] * SL_OPTIMIZER_THRESHOLD
                 else stop_loss + latest["ATR"] * SL_OPTIMIZER_THRESHOLD
             )
-            if (stop_loss - entry_price) == 0:
+            if abs(stop_loss - entry_price) == 0:
                 rr = 0
             else:
                 rr = (entry_price - take_profit) / (stop_loss - entry_price)
         if USE_STOP_TAKE_M15 and (
             take_profit >= entry_price or stop_loss <= entry_price
         ):
-            # if take_profit >= entry_price:
-            #     print(
-            #         f"SHORT USE_STOP_TAKE_M15(TP>=ENTRY) 價格不再區間內 entry-take_profit: {entry_price:.2F}-{take_profit:.2F} 不做交易"
-            #     )
-            # elif stop_loss <= entry_price:
-            #     print(
-            #         f"SHORT USE_STOP_TAKE_M15(SL<=ENTRY) 價格不再區間內 stop_loss-entry: {stop_loss:.2F}-{entry_price:.2F} 不做交易"
-            #     )
+            if take_profit >= entry_price:
+                print(
+                    f"SHORT USE_STOP_TAKE_M15(TP>=ENTRY) 價格不再區間內 entry-take_profit: {entry_price:.2F}-{take_profit:.2F} 不做交易"
+                )
+            elif stop_loss <= entry_price:
+                print(
+                    f"SHORT USE_STOP_TAKE_M15(SL<=ENTRY) 價格不再區間內 stop_loss-entry: {stop_loss:.2F}-{entry_price:.2F} 不做交易"
+                )
 
             return None
 
@@ -253,18 +255,20 @@ def generate_signal(df_main, df_ref, balance):
         sch_loss = (abs(stop_loss - entry_price) * position) * -1
         sch_profit = abs(take_profit - entry_price) * position
 
-        if USE_RR_FILTER and rr <= RR_THRESHOLD:
-            # print(f"SHORT RR 過濾<={RR_THRESHOLD}: {rr:.2f} 不做交易")
+        if USE_RR_FILTER and not (rr <= RR_THRESHOLD_MAX and rr >= RR_THRESHOLD_MIN):
+            print(
+                f"SHORT RR 不再({RR_THRESHOLD_MIN},{RR_THRESHOLD_MAX}): {rr:.2f} 不做交易"
+            )
             return None
         if (sch_profit - profit_close_fee - open_fee) <= MIN_PROFIT:
-            # print(
-            #     f"SHORT MIN_PROFIT<={MIN_PROFIT}: {(sch_profit - profit_close_fee - open_fee):.2f} 不做交易"
-            # )
+            print(
+                f"SHORT MIN_PROFIT<={MIN_PROFIT}: {(sch_profit - profit_close_fee - open_fee):.2f} 不做交易"
+            )
             return None
         if abs(sch_loss - loss_close_fee - open_fee) >= MAX_LOSS:
-            # print(
-            #     f"SHORT MAX_LOSS>={MAX_LOSS}: {abs(sch_loss - loss_close_fee - open_fee):.2F} 不做交易"
-            # )
+            print(
+                f"SHORT MAX_LOSS>={MAX_LOSS}: {abs(sch_loss - loss_close_fee - open_fee):.2F} 不做交易"
+            )
             return None
         return {
             "signal": "SHORT",
@@ -333,7 +337,7 @@ def notify_startup():
     # 假設所有變數已定義
     rsi_status = "✅ 啟用" if USE_RSI_FILTER else "❌ 關閉"
     trend_status = "✅ 啟用" if USE_TREND_FILTER else "❌ 關閉"
-    rr_threshold_display = f"RR > {RR_THRESHOLD}"
+    rr_threshold_display = f"RR > {RR_THRESHOLD_MIN} & < {RR_THRESHOLD_MAX}"
     rr_status = f"✅ 啟用 ({rr_threshold_display})" if USE_RR_FILTER else "❌ 關閉"
     stop_take_logic = "M15 高低點" if USE_STOP_TAKE_M15 else "M5 K線高低點"
     current_time_str = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -820,7 +824,8 @@ def optimize_parameters():
     # 定義參數搜索空間
     param_grid = {
         "LEVERAGE": [15],
-        "RR_THRESHOLD": [1.2, 1.5],
+        "RR_THRESHOLD_MIN": [0.5],
+        "RR_THRESHOLD_MAX": [1.2, 1.5],
         "USE_RSI_FILTER": [True, False],
         "USE_TREND_FILTER": [True, False],
         "USE_RR_FILTER": [True, False],
@@ -847,7 +852,8 @@ def optimize_parameters():
     param_combinations = list(
         itertools.product(
             param_grid["LEVERAGE"],
-            param_grid["RR_THRESHOLD"],
+            param_grid["RR_THRESHOLD_MIN"],
+            param_grid["RR_THRESHOLD_MAX"],
             param_grid["USE_RSI_FILTER"],
             param_grid["USE_TREND_FILTER"],
             param_grid["USE_RR_FILTER"],
@@ -864,7 +870,8 @@ def optimize_parameters():
         # 解包參數
         (
             leverage,
-            rr_threshold,
+            rr_threshold_min,
+            rr_threshold_max,
             use_rsi,
             use_trend,
             use_rr,
@@ -874,7 +881,12 @@ def optimize_parameters():
         ) = params
 
         # 暫存全局變數
-        global LEVERAGE, RR_THRESHOLD, USE_RSI_FILTER, USE_TREND_FILTER
+        global \
+            LEVERAGE, \
+            RR_THRESHOLD_MIN, \
+            RR_THRESHOLD_MAX, \
+            USE_RSI_FILTER, \
+            USE_TREND_FILTER
         global \
             USE_RR_FILTER, \
             USE_STOP_TAKE_M15, \
@@ -883,7 +895,8 @@ def optimize_parameters():
 
         original_params = {
             "LEVERAGE": LEVERAGE,
-            "RR_THRESHOLD": RR_THRESHOLD,
+            "RR_THRESHOLD_MIN": RR_THRESHOLD_MIN,
+            "RR_THRESHOLD_MAX": RR_THRESHOLD_MAX,
             "USE_RSI_FILTER": USE_RSI_FILTER,
             "USE_TREND_FILTER": USE_TREND_FILTER,
             "USE_RR_FILTER": USE_RR_FILTER,
@@ -894,7 +907,8 @@ def optimize_parameters():
 
         # 設置新參數
         LEVERAGE = leverage
-        RR_THRESHOLD = rr_threshold
+        RR_THRESHOLD_MIN = rr_threshold_min
+        RR_THRESHOLD_MAX = rr_threshold_max
         USE_RSI_FILTER = use_rsi
         USE_TREND_FILTER = use_trend
         USE_RR_FILTER = use_rr
@@ -909,7 +923,8 @@ def optimize_parameters():
             # 記錄結果
             result["params"] = {
                 "LEVERAGE": leverage,
-                "RR_THRESHOLD": rr_threshold,
+                "RR_THRESHOLD_MIN": rr_threshold_min,
+                "RR_THRESHOLD_MAX": rr_threshold_max,
                 "USE_RSI_FILTER": use_rsi,
                 "USE_TREND_FILTER": use_trend,
                 "USE_RR_FILTER": use_rr,
@@ -935,7 +950,8 @@ def optimize_parameters():
         finally:
             # 恢復原始參數
             LEVERAGE = original_params["LEVERAGE"]
-            RR_THRESHOLD = original_params["RR_THRESHOLD"]
+            RR_THRESHOLD_MIN = original_params["RR_THRESHOLD_MIN"]
+            RR_THRESHOLD_MAX = original_params["RR_THRESHOLD_MAX"]
             USE_RSI_FILTER = original_params["USE_RSI_FILTER"]
             USE_TREND_FILTER = original_params["USE_TREND_FILTER"]
             USE_RR_FILTER = original_params["USE_RR_FILTER"]
