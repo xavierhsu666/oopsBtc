@@ -1,0 +1,7 @@
+# 臨時設定 (當前 CMD 視窗有效)
+set BINANCE_API_KEY=your_real_api_key
+set BINANCE_API_SECRET=your_real_api_secret
+
+# 永久設定 (系統環境變數)
+setx BINANCE_API_KEY "your_real_api_key"
+setx BINANCE_API_SECRET "your_real_api_secret"
