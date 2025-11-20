@@ -757,6 +757,313 @@ def pratical_scanner():
             time.sleep(15)
 
 
+def optimize_parameters():
+    """優化策略參數以找出最佳回測結果。
+
+    使用網格搜索測試不同參數組合,並返回最佳配置。
+
+    Returns:
+        dict: 包含最佳參數組合和對應績效的字典。
+    """
+    # 定義參數搜索空間
+    param_grid = {
+        "LEVERAGE": [15],
+        "RR_THRESHOLD": [1.2, 1.5],
+        "USE_RSI_FILTER": [True, False],
+        "USE_TREND_FILTER": [True, False],
+        "USE_RR_FILTER": [True, False],
+        "USE_STOP_TAKE_M15": [True, False],
+        "USE_SL_OPTIMIZER": [True, False],
+        "SL_OPTIMIZER_THRESHOLD": [0.3, 0.5],
+    }
+
+    best_result = {
+        "total_pnl": -float("inf"),
+        "params": {},
+        "win_rate": 0,
+        "total_trades": 0,
+        "final_balance": 0,
+        "max_drawdown": 0,
+        "profit_factor": 0,
+    }
+
+    results_list = []
+
+    # 計算總組合數
+    import itertools
+
+    param_combinations = list(
+        itertools.product(
+            param_grid["LEVERAGE"],
+            param_grid["RR_THRESHOLD"],
+            param_grid["USE_RSI_FILTER"],
+            param_grid["USE_TREND_FILTER"],
+            param_grid["USE_RR_FILTER"],
+            param_grid["USE_STOP_TAKE_M15"],
+            param_grid["USE_SL_OPTIMIZER"],
+            param_grid["SL_OPTIMIZER_THRESHOLD"],
+        )
+    )
+
+    total_combinations = len(param_combinations)
+    print(f"開始參數優化,總共 {total_combinations} 種組合...")
+
+    for idx, params in enumerate(param_combinations, 1):
+        # 解包參數
+        (
+            leverage,
+            rr_threshold,
+            use_rsi,
+            use_trend,
+            use_rr,
+            use_stop_m15,
+            use_sl_opt,
+            sl_opt_th,
+        ) = params
+
+        # 暫存全局變數
+        global LEVERAGE, RR_THRESHOLD, USE_RSI_FILTER, USE_TREND_FILTER
+        global \
+            USE_RR_FILTER, \
+            USE_STOP_TAKE_M15, \
+            USE_SL_OPTIMIZER, \
+            SL_OPTIMIZER_THRESHOLD
+
+        original_params = {
+            "LEVERAGE": LEVERAGE,
+            "RR_THRESHOLD": RR_THRESHOLD,
+            "USE_RSI_FILTER": USE_RSI_FILTER,
+            "USE_TREND_FILTER": USE_TREND_FILTER,
+            "USE_RR_FILTER": USE_RR_FILTER,
+            "USE_STOP_TAKE_M15": USE_STOP_TAKE_M15,
+            "USE_SL_OPTIMIZER": USE_SL_OPTIMIZER,
+            "SL_OPTIMIZER_THRESHOLD": SL_OPTIMIZER_THRESHOLD,
+        }
+
+        # 設置新參數
+        LEVERAGE = leverage
+        RR_THRESHOLD = rr_threshold
+        USE_RSI_FILTER = use_rsi
+        USE_TREND_FILTER = use_trend
+        USE_RR_FILTER = use_rr
+        USE_STOP_TAKE_M15 = use_stop_m15
+        USE_SL_OPTIMIZER = use_sl_opt
+        SL_OPTIMIZER_THRESHOLD = sl_opt_th
+
+        try:
+            # 執行回測
+            result = backtest_with_return()
+
+            # 記錄結果
+            result["params"] = {
+                "LEVERAGE": leverage,
+                "RR_THRESHOLD": rr_threshold,
+                "USE_RSI_FILTER": use_rsi,
+                "USE_TREND_FILTER": use_trend,
+                "USE_RR_FILTER": use_rr,
+                "USE_STOP_TAKE_M15": use_stop_m15,
+                "USE_SL_OPTIMIZER": use_sl_opt,
+                "SL_OPTIMIZER_THRESHOLD": sl_opt_th,
+            }
+            results_list.append(result)
+
+            # 更新最佳結果(以總盈虧為主要指標)
+            if result["total_pnl"] > best_result["total_pnl"]:
+                best_result = result.copy()
+
+            # 進度顯示
+            if idx % 10 == 0 or idx == total_combinations:
+                print(
+                    f"進度: {idx}/{total_combinations} ({idx / total_combinations * 100:.1f}%)"
+                )
+
+        except Exception as e:
+            print(f"參數組合 {idx} 執行失敗: {e}")
+            continue
+        finally:
+            # 恢復原始參數
+            LEVERAGE = original_params["LEVERAGE"]
+            RR_THRESHOLD = original_params["RR_THRESHOLD"]
+            USE_RSI_FILTER = original_params["USE_RSI_FILTER"]
+            USE_TREND_FILTER = original_params["USE_TREND_FILTER"]
+            USE_RR_FILTER = original_params["USE_RR_FILTER"]
+            USE_STOP_TAKE_M15 = original_params["USE_STOP_TAKE_M15"]
+            USE_SL_OPTIMIZER = original_params["USE_SL_OPTIMIZER"]
+            SL_OPTIMIZER_THRESHOLD = original_params["SL_OPTIMIZER_THRESHOLD"]
+
+    # 輸出結果
+    print("\n" + "=" * 60)
+    print("參數優化完成!")
+    print("=" * 60)
+    print(f"\n最佳參數組合:")
+    for key, value in best_result["params"].items():
+        print(f"  {key}: {value}")
+
+    print(f"\n最佳績效:")
+    print(f"  總淨盈虧: {best_result['total_pnl']:.2f} USDT")
+    print(f"  最終資金: {best_result['final_balance']:.2f} USDT")
+    print(
+        f"  報酬率: {(best_result['final_balance'] / INITIAL_BALANCE - 1) * 100:.2f}%"
+    )
+    print(f"  交易次數: {best_result['total_trades']}")
+    print(f"  勝率: {best_result['win_rate']:.2f}%")
+    print(f"  獲利因子: {best_result['profit_factor']:.2f}")
+    print(f"  最大單筆虧損: {best_result['max_drawdown']:.2f} USDT")
+
+    # 匯出所有結果
+    results_df = pd.DataFrame(results_list)
+    results_df = results_df.sort_values("total_pnl", ascending=False)
+    results_df.to_excel("optimization_results.xlsx", index=False)
+    print(f"\n所有優化結果已匯出至 optimization_results.xlsx")
+
+    return best_result
+
+
+def backtest_with_return():
+    """執行回測並返回結果(不印出詳細資訊)。
+
+    Returns:
+        dict: 包含回測績效指標的字典。
+    """
+    balance = INITIAL_BALANCE
+    position = 0
+    entry_price = 0
+    stop_loss = 0
+    take_profit = 0
+    rr = 0
+    entry_time = None
+    trades = []
+    signal_info = None
+
+    # 取得完整資料
+    df_main_b = get_klines(SYMBOL, INTERVAL_MAIN, BACKTEST_LIMIT)
+    df_ref_b = get_klines(SYMBOL, INTERVAL_REF, BACKTEST_LIMIT)
+
+    df_main_b = calculate_indicators(df_main_b)
+    df_ref_b = calculate_indicators(df_ref_b)
+
+    # 從第 21 根 K 線開始回測
+    for i in range(21, len(df_main_b)):
+        current_time = df_main_b.iloc[i]["timestamp"]
+
+        df_main = df_main_b[df_main_b["timestamp"] <= current_time].iloc[-22:]
+        df_ref = df_ref_b[df_ref_b["timestamp"] <= current_time].iloc[-22:]
+
+        if len(df_main) < 22 or len(df_ref) < 22:
+            continue
+
+        latest = df_main.iloc[-1]
+
+        # 平倉檢查
+        if position != 0 and signal_info is not None:
+            exit_price = None
+
+            if position > 0:
+                if latest["low"] <= stop_loss:
+                    exit_price = stop_loss
+                elif latest["high"] >= take_profit:
+                    exit_price = take_profit
+
+                if exit_price:
+                    pnl = (exit_price - entry_price) * position
+
+            else:
+                if latest["high"] >= stop_loss:
+                    exit_price = stop_loss
+                elif latest["low"] <= take_profit:
+                    exit_price = take_profit
+
+                if exit_price:
+                    pnl = (entry_price - exit_price) * abs(position)
+
+            if exit_price:
+                open_fee = signal_info["open_fee"]
+                close_fee = (exit_price * abs(position)) * TAKER_FEE_RATE
+                total_fee = open_fee + close_fee
+                net_pnl = pnl - total_fee
+
+                margin = (abs(position) * entry_price) / LEVERAGE
+                balance = balance + margin + net_pnl
+
+                trades.append(net_pnl)
+                position = 0
+                signal_info = None
+
+                if balance <= 0:
+                    break
+
+        # 開倉條件
+        if position == 0:
+            signal_info = generate_signal(df_main, df_ref, balance)
+            if signal_info:
+                entry_price = signal_info["entry_price"]
+                stop_loss = signal_info["stop_loss"]
+                take_profit = signal_info["take_profit"]
+                rr = signal_info["rr"]
+                entry_time = latest["timestamp"]
+                position = (
+                    signal_info["position"]
+                    if signal_info["signal"] == "LONG"
+                    else -signal_info["position"]
+                )
+
+                margin = (abs(position) * entry_price) / LEVERAGE
+
+                if balance < margin:
+                    signal_info = None
+                    continue
+
+                balance -= margin
+
+    # 處理最後未平倉的持倉
+    if position != 0 and signal_info is not None:
+        exit_price = df_main_b.iloc[-1]["close"]
+
+        if position > 0:
+            pnl = (exit_price - entry_price) * position
+        else:
+            pnl = (entry_price - exit_price) * abs(position)
+
+        open_fee = signal_info["open_fee"]
+        close_fee = (exit_price * abs(position)) * TAKER_FEE_RATE
+        total_fee = open_fee + close_fee
+        net_pnl = pnl - total_fee
+
+        margin = (abs(position) * entry_price) / LEVERAGE
+        balance = balance + margin + net_pnl
+
+        trades.append(net_pnl)
+
+    # 統計結果
+    win_trades = [t for t in trades if t > 0]
+    lose_trades = [t for t in trades if t <= 0]
+    win_rate = len(win_trades) / len(trades) * 100 if trades else 0
+    total_pnl = sum(trades)
+    max_drawdown = min(trades) if trades else 0
+
+    # 計算獲利因子
+    total_profit = sum(win_trades) if win_trades else 0
+    total_loss = abs(sum(lose_trades)) if lose_trades else 0
+    profit_factor = (
+        total_profit / total_loss
+        if total_loss > 0
+        else (float("inf") if total_profit > 0 else 0)
+    )
+
+    return {
+        "total_pnl": total_pnl,
+        "final_balance": balance,
+        "total_trades": len(trades),
+        "win_rate": win_rate,
+        "max_drawdown": max_drawdown,
+        "profit_factor": profit_factor,
+        "win_trades": len(win_trades),
+        "lose_trades": len(lose_trades),
+    }
+
+
+# ===== 執行回測參數優化 =====
+# best_params = optimize_parameters()
 # ===== 執行回測 =====
 backtest()
 
